@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "controllability"
+version = "0.1.0"
+description = "Stress-testing CoT controllability of reasoning models"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "aiohttp>=3.9",
+    "tqdm>=4.66",
+    "python-dotenv>=1.0",
+    "pandas>=2.0",
+    "scikit-learn>=1.4",
+    # Required by ReasonIF submodule's instruction checkers
+    "fast-langdetect>=0.3",
+    "immutabledict>=4.0",
+    "nltk>=3.9.1",
+]
+
+[project.optional-dependencies]
+tinker = [
+    "tinker",
+    "tinker-cookbook",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/controllability"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

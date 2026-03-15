@@ -1,0 +1,6 @@
+[submodule "external/CoTControl"]
+	path = external/CoTControl
+	url = https://github.com/YuehHanChen/CoTControl.git
+[submodule "external/reasonIF"]
+	path = external/reasonIF
+	url = https://github.com/ykwon0407/reasonIF.git

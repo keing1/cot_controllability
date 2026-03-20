@@ -18,7 +18,14 @@ REASONING_MODEL_PATTERNS = (
     "o1",
     "o3",
     "o4",
+    "kimi",
 )
+
+# Models that use a simple `include_reasoning: true` flag instead of `reasoning.max_tokens`
+REASONING_SIMPLE_FLAG_PATTERNS = ("kimi",)
+
+# Models that support `reasoning.effort` ("low"/"medium"/"high") instead of max_tokens
+REASONING_EFFORT_PATTERNS = ("gpt-oss", "o1", "o3", "o4")
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -32,14 +39,23 @@ def _is_reasoning_model(model: str) -> bool:
 class OpenRouterClient:
     """Async inference client for OpenRouter."""
 
-    def __init__(self, api_key: str, default_reasoning_tokens: int = 25000):
+    def __init__(
+        self,
+        api_key: str,
+        default_reasoning_tokens: int = 25000,
+        request_timeout: int = 300,
+        reasoning_effort: str | None = None,
+    ):
         self.api_key = api_key
         self.default_reasoning_tokens = default_reasoning_tokens
+        self._request_timeout = request_timeout
+        self.reasoning_effort = reasoning_effort  # "low", "medium", "high", or None
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=self._request_timeout)
+            self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
     async def complete(self, request: InferenceRequest) -> InferenceResponse:
@@ -55,7 +71,15 @@ class OpenRouterClient:
 
         # Add reasoning budget for reasoning models
         if _is_reasoning_model(request.model):
-            payload["reasoning"] = {"max_tokens": self.default_reasoning_tokens}
+            if any(p in request.model.lower() for p in REASONING_SIMPLE_FLAG_PATTERNS):
+                payload["include_reasoning"] = True
+            elif (
+                self.reasoning_effort
+                and any(p in request.model.lower() for p in REASONING_EFFORT_PATTERNS)
+            ):
+                payload["reasoning"] = {"effort": self.reasoning_effort}
+            else:
+                payload["reasoning"] = {"max_tokens": self.default_reasoning_tokens}
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -85,7 +109,7 @@ class OpenRouterClient:
             message = choice["message"]
 
             content = message.get("content", "") or ""
-            reasoning = message.get("reasoning_content", "") or ""
+            reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
 
             # Some providers embed reasoning in <think> tags within content
             # instead of in reasoning_content. Parse it out.
@@ -110,6 +134,7 @@ class OpenRouterClient:
                 reasoning=reasoning,
                 latency_ms=latency_ms,
                 usage=usage,
+                raw_response=data,
             )
 
         except Exception as e:

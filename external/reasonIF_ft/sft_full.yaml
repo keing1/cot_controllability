@@ -1,0 +1,25 @@
+# Model
+model_name_or_path: openai/gpt-oss-20b
+attn_implementation: eager
+torch_dtype: bfloat16
+
+# Dataset
+dataset_name: {your_huggingface_account_name}/{your_dataset_name}
+dataset_num_proc: 12
+
+# Hyperparameters
+learning_rate:  5.0e-6
+gradient_checkpointing: true
+num_train_epochs: 0.25
+logging_steps: 1
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 1
+max_length: 8192
+warmup_ratio: 0.03
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+output_dir: gpt-oss-20b-rif
+report_to:
+- trackio
+seed: 42

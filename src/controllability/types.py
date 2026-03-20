@@ -37,6 +37,7 @@ class InferenceResponse(BaseModel):
     latency_ms: float = 0.0
     usage: dict[str, int] = {}
     error: str | None = None
+    raw_response: dict[str, Any] | None = None  # Complete API response for debugging
 
 
 class Rollout(BaseModel):
@@ -63,3 +64,4 @@ class Rollout(BaseModel):
     latency_ms: float = 0.0
     usage: dict[str, int] = {}
     grading_details: dict[str, Any] = {}
+    raw_response: dict[str, Any] | None = None

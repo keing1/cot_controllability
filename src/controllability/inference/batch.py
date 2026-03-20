@@ -16,11 +16,24 @@ async def _single_with_retry(
     request: InferenceRequest,
     semaphore: asyncio.Semaphore,
     max_retries: int,
+    sample_timeout: float | None = 720,
 ) -> InferenceResponse:
-    """Execute a single request with semaphore and exponential backoff retry."""
+    """Execute a single request with semaphore and exponential backoff retry.
+
+    Args:
+        sample_timeout: Total wall-clock timeout in seconds across all attempts
+            for a single sample. None disables. Default 720s (12 min).
+    """
     last_response: InferenceResponse | None = None
+    deadline = asyncio.get_event_loop().time() + sample_timeout if sample_timeout else None
 
     for attempt in range(max_retries + 1):
+        if deadline and asyncio.get_event_loop().time() >= deadline:
+            return InferenceResponse(
+                content="",
+                error=f"sample_timeout: {sample_timeout}s exceeded after {attempt} attempts",
+            )
+
         async with semaphore:
             response = await client.complete(request)
 
@@ -31,6 +44,8 @@ async def _single_with_retry(
 
         if attempt < max_retries:
             delay = (2**attempt) + random.uniform(0, 1)
+            if deadline and asyncio.get_event_loop().time() + delay >= deadline:
+                break
             await asyncio.sleep(delay)
 
     # All retries exhausted -- return last error response

@@ -12,11 +12,15 @@ from controllability.evals.grading import (
     detect_meta_discussion,
     extract_answer,
     grade_correctness,
-    judge_ignore_question,
+    judge_ignore_question_async,
 )
 from controllability.evals.metrics import compute_metrics, format_metrics
 from controllability.evals.modes import get_mode
-from controllability.evals.prompts import build_cotcontrol_prompts, build_reasonif_prompts
+from controllability.evals.prompts import (
+    apply_number_words_calibration,
+    build_cotcontrol_prompts,
+    build_reasonif_prompts,
+)
 from controllability.inference.base import InferenceClient
 from controllability.inference.batch import run_batch
 from controllability.inference.openrouter import OpenRouterClient
@@ -33,13 +37,20 @@ def _create_client(config: ExperimentConfig, settings: Settings) -> InferenceCli
     if config.backend == "openrouter":
         if not settings.openrouter_api_key:
             raise ValueError("OPENROUTER_API_KEY not set. Check your .env file.")
-        return OpenRouterClient(api_key=settings.openrouter_api_key)
+        return OpenRouterClient(
+            api_key=settings.openrouter_api_key,
+            request_timeout=config.request_timeout,
+        )
     elif config.backend == "tinker":
         from controllability.inference.tinker_client import TinkerClient
 
         if not settings.tinker_api_key:
             raise ValueError("TINKER_API_KEY not set. Check your .env file.")
-        return TinkerClient(model=config.model)
+        return TinkerClient(
+            model=config.model,
+            model_path=config.model_path,
+            reasoning_effort=config.reasoning_effort,
+        )
     else:
         raise ValueError(f"Unknown backend: {config.backend}")
 
@@ -95,6 +106,14 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
     print(f"  {len(samples)} samples after split={config.split}, fraction={config.fraction}"
           + (f", n_samples={config.n_samples}" if config.n_samples else ""))
 
+    # Apply model-specific number_words calibration (if available)
+    if "number_words" in config.modes or config.dataset == "reasonif":
+        n_patched = apply_number_words_calibration(
+            samples, model=config.model, reasoning_effort=config.reasoning_effort,
+        )
+        if n_patched:
+            print(f"  Applied model-specific number_words thresholds to {n_patched} samples")
+
     # Check for completed work (resume support)
     completed_keys = load_completed_keys(output_path)
     if completed_keys:
@@ -105,11 +124,13 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
     all_rollouts: list[Rollout] = []
 
     try:
+        # Collect all pending work across modes, then run in one big batch
+        work_items: list[tuple[str, Sample, str, str, InferenceRequest]] = []
+        # (mode_name, sample, sys_prompt, usr_prompt, request)
+
         for mode_name in config.modes:
             mode = get_mode(mode_name)
-            print(f"\nMode: {mode_name}")
 
-            # For ReasonIF modes, filter to samples matching the instruction type
             if mode.source == "reasonif":
                 mode_samples = [
                     s for s in samples
@@ -118,84 +139,88 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
             else:
                 mode_samples = samples
 
-            # Filter out already-completed samples
             pending_samples = [
                 s for s in mode_samples if (s.id, mode_name) not in completed_keys
             ]
 
             if not pending_samples:
+                print(f"\nMode: {mode_name}")
                 print(f"  All {len(mode_samples)} samples already completed, skipping")
                 continue
 
+            print(f"\nMode: {mode_name}")
             print(f"  {len(pending_samples)} pending samples (of {len(mode_samples)} total)")
-
-            # Build prompts and inference requests
-            prompt_pairs: list[tuple[str, str]] = []
-            requests: list[InferenceRequest] = []
 
             for sample in pending_samples:
                 sys_prompt, usr_prompt = _build_prompts(
                     mode_name, sample, config.model, config.adversarial_pressure
                 )
-                prompt_pairs.append((sys_prompt, usr_prompt))
 
                 messages = []
                 if sys_prompt:
                     messages.append({"role": "system", "content": sys_prompt})
                 messages.append({"role": "user", "content": usr_prompt})
 
-                requests.append(
-                    InferenceRequest(
-                        messages=messages,
-                        model=config.model,
-                        max_tokens=config.max_tokens,
-                        temperature=config.temperature,
-                    )
+                request = InferenceRequest(
+                    messages=messages,
+                    model=config.model,
+                    max_tokens=config.max_tokens,
+                    temperature=config.temperature,
                 )
+                work_items.append((mode_name, sample, sys_prompt, usr_prompt, request))
 
-            # Run batch inference
+        if not work_items:
+            print("\nAll work already completed.")
+        else:
+            # Run ALL requests in one batch (single shared semaphore)
+            all_requests = [item[4] for item in work_items]
+            print(f"\nRunning {len(all_requests)} requests across {len(config.modes)} modes...")
             responses = await run_batch(
                 client,
-                requests,
+                all_requests,
                 max_concurrency=config.max_concurrency,
                 max_retries=config.max_retries,
-                desc=f"  {mode_name}",
+                desc="  all_modes",
             )
 
-            # Grade and create rollouts
-            mode_rollouts: list[Rollout] = []
-            for sample, (sys_prompt, usr_prompt), resp in zip(
-                pending_samples, prompt_pairs, responses
+            # Grade and create rollouts, grouped by mode for saving.
+            # ignore_question grading uses async LLM calls — collect and batch.
+            mode_rollouts_map: dict[str, list[Rollout]] = {}
+
+            # First pass: grade everything except ignore_question, collect
+            # pending judge items with their pre-computed rollout fields.
+            graded: list[tuple[dict, dict]] = []  # (rollout_kwargs, grading_placeholder)
+            pending_judge: list[tuple[int, str, str]] = []  # (index, reasoning, user_prompt)
+
+            for idx, ((mode_name, sample, sys_prompt, usr_prompt, _request), resp) in enumerate(
+                zip(work_items, responses)
             ):
-                # Extract answer and grade correctness
+                mode = get_mode(mode_name)
+
                 extracted = extract_answer(resp.content, sample.options)
                 correct = grade_correctness(extracted, sample.correct_answer, sample.options)
 
-                # Grade compliance -- only on reasoning trace, not final response
                 if resp.error:
                     grading_result = {"error": resp.error}
                     compliant = None
                 elif not resp.reasoning and mode_name == "ignore_question":
-                    # No reasoning = non-compliant (constraint says "think about anything else")
                     grading_result = {"compliant": False, "mode": "ignore_question", "note": "no_reasoning"}
                     compliant = False
                 elif not resp.reasoning:
                     grading_result = {"error": "no_reasoning_trace"}
                     compliant = None
                 elif mode_name == "ignore_question":
-                    grading_result = judge_ignore_question(
-                        reasoning=resp.reasoning,
-                        user_prompt=usr_prompt,
-                    )
-                    compliant = grading_result.get("compliant")
+                    # Defer to async batch below
+                    grading_result = None
+                    compliant = None
+                    pending_judge.append((idx, resp.reasoning, usr_prompt))
                 else:
                     grading_result = mode.grade_compliance(resp.reasoning, sample)
                     compliant = grading_result.get("compliant")
 
-                # Detect meta-discussion in reasoning trace
                 meta = detect_meta_discussion(resp.reasoning) if resp.reasoning else None
 
-                rollout = Rollout(
+                rollout_kwargs = dict(
                     experiment_id=config.experiment_id,
                     sample=sample,
                     model=config.model,
@@ -212,19 +237,37 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
                     latency_ms=resp.latency_ms,
                     usage=resp.usage,
                     grading_details=grading_result,
+                    raw_response=resp.raw_response,
                 )
-                mode_rollouts.append(rollout)
+                graded.append((rollout_kwargs, {}))
 
-            # Save incrementally
-            append_rollouts(output_path, mode_rollouts)
-            all_rollouts.extend(mode_rollouts)
+            # Batch async LLM judge for ignore_question
+            if pending_judge:
+                print(f"  Judging {len(pending_judge)} ignore_question samples (async)...")
+                judge_coros = [
+                    judge_ignore_question_async(reasoning=reasoning, user_prompt=usr_prompt)
+                    for _, reasoning, usr_prompt in pending_judge
+                ]
+                judge_results = await asyncio.gather(*judge_coros)
+                for (rollout_idx, _, _), result in zip(pending_judge, judge_results):
+                    graded[rollout_idx][0]["grading_details"] = result
+                    graded[rollout_idx][0]["compliant"] = result.get("compliant")
 
-            # Print mode summary
-            mode_metrics = compute_metrics(mode_rollouts)
-            for _, m in mode_metrics.get("by_mode", {}).items():
-                acc = f"{m['accuracy']:.1%}"
-                comply = f"{m['compliance_rate']:.1%}" if m['compliance_rate'] is not None else "N/A"
-                print(f"  accuracy={acc}  compliance={comply}  n={m['n']}")
+            # Create rollouts and group by mode
+            for rollout_kwargs, _ in graded:
+                rollout = Rollout(**rollout_kwargs)
+                mode_rollouts_map.setdefault(rollout.control_mode, []).append(rollout)
+
+            # Save per-mode and print summaries
+            for mode_name, mode_rollouts in mode_rollouts_map.items():
+                append_rollouts(output_path, mode_rollouts)
+                all_rollouts.extend(mode_rollouts)
+
+                mode_metrics = compute_metrics(mode_rollouts)
+                for _, m in mode_metrics.get("by_mode", {}).items():
+                    acc = f"{m['accuracy']:.1%}"
+                    comply = f"{m['compliance_rate']:.1%}" if m['compliance_rate'] is not None else "N/A"
+                    print(f"  {mode_name}: accuracy={acc}  compliance={comply}  n={m['n']}")
 
     finally:
         await client.close()

@@ -56,6 +56,8 @@ class TinkerClient:
         model: str,
         max_tokens: int = 16384,
         temperature: float = 1.0,
+        model_path: str | None = None,
+        reasoning_effort: str = "high",
     ):
         import tinker
         from transformers import AutoTokenizer
@@ -69,9 +71,15 @@ class TinkerClient:
         self._base_model = self._resolve_base_model(model)
 
         service_client = tinker.ServiceClient()
-        self._sampling_client = service_client.create_sampling_client(
-            base_model=self._base_model
-        )
+        if model_path:
+            # Use a checkpoint / fine-tuned model path
+            self._sampling_client = service_client.create_sampling_client(
+                model_path=model_path
+            )
+        else:
+            self._sampling_client = service_client.create_sampling_client(
+                base_model=self._base_model
+            )
 
         # Load tokenizer and renderer
         tokenizer = AutoTokenizer.from_pretrained(self._base_model)
@@ -83,7 +91,7 @@ class TinkerClient:
         renderer_kwargs = {}
         if "gpt-oss" in model.lower():
             renderer_kwargs["use_system_prompt"] = True
-            renderer_kwargs["reasoning_effort"] = "high"
+            renderer_kwargs["reasoning_effort"] = reasoning_effort
 
         self._renderer = renderer_cls(tokenizer=tokenizer, **renderer_kwargs)
         self._stop_condition = self._renderer.get_stop_sequences()

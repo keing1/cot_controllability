@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -111,8 +113,90 @@ def build_cotcontrol_prompts(
 
 
 # ---------------------------------------------------------------------------
-# ReasonIF prompt building
+# ReasonIF prompt building — model-specific number_words calibration
 # ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_CALIBRATION_FILE = _REPO_ROOT / "results" / "calibration" / "number_words_reference.json"
+
+# Cache loaded calibration data
+_calibration_cache: dict | None = None
+
+
+def _load_calibration() -> dict:
+    """Load the calibration reference file. Returns empty dict if not found."""
+    global _calibration_cache
+    if _calibration_cache is not None:
+        return _calibration_cache
+    if _CALIBRATION_FILE.exists():
+        with open(_CALIBRATION_FILE) as f:
+            _calibration_cache = json.load(f)
+    else:
+        _calibration_cache = {}
+    return _calibration_cache
+
+
+def get_calibration_key(
+    model: str, reasoning_effort: str | None = None
+) -> str:
+    """Build the calibration lookup key for a model.
+
+    E.g. "openai/gpt-oss-20b" with effort "medium" -> "gpt-oss-20b@medium"
+         "qwen/qwen3-8b" -> "qwen3-8b"
+    """
+    short = model.split("/")[-1]
+    if reasoning_effort and "gpt-oss" in model:
+        return f"{short}@{reasoning_effort}"
+    return short
+
+
+def _replace_word_limit(text: str, new_limit: int) -> str:
+    """Replace the numeric word limit in 'less than N words'."""
+    return re.sub(r"(?<=less than )\d+(?= words)", str(new_limit), text)
+
+
+def apply_number_words_calibration(
+    samples: list[Sample],
+    model: str,
+    reasoning_effort: str | None = None,
+) -> int:
+    """Patch number_words samples with model-specific thresholds in-place.
+
+    Updates both constraint_args["num_words"] and the original_prompt text
+    for each number_words sample. Returns the number of samples patched.
+    """
+    calibration = _load_calibration()
+    key = get_calibration_key(model, reasoning_effort)
+
+    if key not in calibration:
+        return 0
+
+    thresholds = calibration[key]
+    patched = 0
+
+    for sample in samples:
+        if sample.metadata.get("instruction_type") != "number_words":
+            continue
+
+        source = sample.metadata.get("source", "")
+        if source not in thresholds:
+            continue
+
+        new_num_words = int(thresholds[source])
+        constraint_args = sample.metadata.get("constraint_args")
+        if constraint_args and "num_words" in constraint_args:
+            constraint_args["num_words"] = new_num_words
+
+        original_prompt = sample.metadata.get("original_prompt", "")
+        if original_prompt:
+            sample.metadata["original_prompt"] = _replace_word_limit(
+                original_prompt, new_num_words
+            )
+
+        patched += 1
+
+    return patched
+
 
 def build_reasonif_instruction(sample: Sample) -> str:
     """Build the instruction text for a ReasonIF sample.
@@ -125,7 +209,6 @@ def build_reasonif_instruction(sample: Sample) -> str:
     # The ReasonIF prompt format is:
     # "Think step-by-step, ... Format your reasoning according to the following rule: **{instruction}**\n\nHere is the question:\n\n{question}"
     # Extract the instruction between ** markers
-    import re
     match = re.search(r"\*\*(.*?)\*\*", original_prompt)
     if match:
         return match.group(1)

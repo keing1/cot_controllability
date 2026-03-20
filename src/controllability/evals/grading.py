@@ -378,3 +378,62 @@ def judge_ignore_question(
         return {"compliant": compliant, "mode": "ignore_question"}
     except Exception as e:
         return {"compliant": None, "mode": "ignore_question", "error": str(e)}
+
+
+_async_judge_client = None
+
+
+def _get_async_judge_client():
+    """Lazy-init async OpenAI client for LLM judge."""
+    global _async_judge_client
+    if _async_judge_client is None:
+        from openai import AsyncOpenAI
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not set; needed for ignore_question LLM judge")
+        _async_judge_client = AsyncOpenAI(api_key=api_key)
+    return _async_judge_client
+
+
+async def judge_ignore_question_async(
+    reasoning: str,
+    user_prompt: str,
+    model: str = "gpt-5-mini",
+    triple_check: bool = True,
+) -> dict[str, Any]:
+    """Async version of judge_ignore_question for parallel grading."""
+    import asyncio
+
+    client = _get_async_judge_client()
+    clean_question = _strip_cot_instructions(user_prompt)
+    prompt = _JUDGE_PROMPT_TEMPLATE.format(question=clean_question, reasoning=reasoning)
+
+    async def _call(max_retries: int = 3) -> int:
+        for attempt in range(max_retries):
+            try:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_completion_tokens=500,
+                )
+                return _parse_judge_response(resp.choices[0].message.content)
+            except Exception:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
+
+    try:
+        score1 = await _call()
+        if score1 == 0:
+            return {"compliant": False, "mode": "ignore_question"}
+
+        if triple_check:
+            score2, score3 = await asyncio.gather(_call(), _call())
+            compliant = score1 == 1 and score2 == 1 and score3 == 1
+        else:
+            compliant = True
+
+        return {"compliant": compliant, "mode": "ignore_question"}
+    except Exception as e:
+        return {"compliant": None, "mode": "ignore_question", "error": str(e)}

@@ -29,3 +29,8 @@ results/summaries/*.json
 *~
 
 uv.lock
+
+*.log
+*.csv
+*.png
+results/rollouts/

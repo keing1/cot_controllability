@@ -37,6 +37,9 @@ class ExperimentConfig(BaseSettings):
     output_dir: str = "results/rollouts"
     adversarial_pressure: str = "none"
     n_samples: int | None = None
+    model_path: str | None = None  # Tinker checkpoint path (tinker://...)
+    reasoning_effort: str = "high"  # Reasoning effort for gpt-oss models
+    request_timeout: int = 300  # Per-request timeout in seconds (not in experiment_id)
 
     @property
     def experiment_id(self) -> str:
@@ -51,6 +54,8 @@ class ExperimentConfig(BaseSettings):
                 "seed": self.seed,
                 "adversarial_pressure": self.adversarial_pressure,
                 "n_samples": self.n_samples,
+                "model_path": self.model_path,
+                "reasoning_effort": self.reasoning_effort,
             },
             sort_keys=True,
         )

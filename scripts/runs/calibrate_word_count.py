@@ -69,7 +69,7 @@ def count_words(text: str) -> int:
 
 def _create_client(
     backend: str, model: str, settings: Settings,
-    model_path: str | None = None, reasoning_effort: str = "high",
+    model_path: str | None = None, reasoning_effort: str = "none",
     request_timeout: int = 420,
 ) -> InferenceClient:
     """Create inference client."""
@@ -100,7 +100,7 @@ async def calibrate_model(
     model: str,
     backend: str = "tinker",
     model_path: str | None = None,
-    reasoning_effort: str = "high",
+    reasoning_effort: str = "none",
     n_runs: int = 3,
     max_concurrency: int = 100,
     max_tokens: int = 28000,

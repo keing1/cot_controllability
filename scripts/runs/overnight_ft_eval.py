@@ -132,7 +132,7 @@ class FTModelSpec:
     parquet: str         # filename under results/sft/
     log_path: str        # checkpoint output dir name under results/sft/
     renderer_type: str   # "gpt-oss" or "qwen3"
-    reasoning_effort: str  # "medium" for gpt, "high" for qwen
+    reasoning_effort: str  # "medium" for gpt, "none" for qwen
     short_name: str = ""   # for --models filtering
 
     def __post_init__(self):
@@ -164,7 +164,7 @@ FT_MODELS = [
         parquet="qwen3-8b-reasonif-sft.parquet",
         log_path="qwen3-8b-reasonif",
         renderer_type="qwen3",
-        reasoning_effort="high",
+        reasoning_effort="none",
     ),
     FTModelSpec(
         model="qwen/qwen3-32b",
@@ -172,7 +172,7 @@ FT_MODELS = [
         parquet="qwen3-32b-reasonif-sft.parquet",
         log_path="qwen3-32b-reasonif",
         renderer_type="qwen3",
-        reasoning_effort="high",
+        reasoning_effort="none",
     ),
 ]
 

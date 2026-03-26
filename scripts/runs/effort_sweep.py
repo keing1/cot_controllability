@@ -36,7 +36,9 @@ logging.basicConfig(
 # --------------------------------------------------------------------------- #
 
 EFFORT_SWEEP = [
-    {"model": "openai/gpt-oss-20b", "efforts": ["low", "medium", "high"]},
+    # 20b: low + medium already done from prior overnight run; only high remaining
+    {"model": "openai/gpt-oss-20b", "efforts": ["high"]},
+    # 120b: medium already done from prior overnight run; low + high remaining
     {"model": "openai/gpt-oss-120b", "efforts": ["low", "high"]},
 ]
 

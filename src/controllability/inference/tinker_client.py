@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -57,7 +58,8 @@ class TinkerClient:
         max_tokens: int = 16384,
         temperature: float = 1.0,
         model_path: str | None = None,
-        reasoning_effort: str = "high",
+        reasoning_effort: str = "none",
+        request_timeout: int = 300,
     ):
         import tinker
         from transformers import AutoTokenizer
@@ -66,6 +68,7 @@ class TinkerClient:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self._request_timeout = request_timeout
 
         # Resolve model to base_model for Tinker
         self._base_model = self._resolve_base_model(model)
@@ -138,14 +141,17 @@ class TinkerClient:
             model_input = self._renderer.build_generation_prompt(messages)
 
             # Sample with our temperature
-            response = await self._sampling_client.sample_async(
-                model_input,
-                num_samples=1,
-                sampling_params=self._tinker.SamplingParams(
-                    temperature=request.temperature or self.temperature,
-                    max_tokens=request.max_tokens or self.max_tokens,
-                    stop=self._stop_condition,
+            response = await asyncio.wait_for(
+                self._sampling_client.sample_async(
+                    model_input,
+                    num_samples=1,
+                    sampling_params=self._tinker.SamplingParams(
+                        temperature=request.temperature or self.temperature,
+                        max_tokens=request.max_tokens or self.max_tokens,
+                        stop=self._stop_condition,
+                    ),
                 ),
+                timeout=self._request_timeout,
             )
 
             latency_ms = (time.monotonic() - start) * 1000

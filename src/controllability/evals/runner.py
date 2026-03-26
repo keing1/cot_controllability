@@ -50,6 +50,7 @@ def _create_client(config: ExperimentConfig, settings: Settings) -> InferenceCli
             model=config.model,
             model_path=config.model_path,
             reasoning_effort=config.reasoning_effort,
+            request_timeout=config.request_timeout,
         )
     else:
         raise ValueError(f"Unknown backend: {config.backend}")

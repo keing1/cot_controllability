@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
+import time
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
@@ -63,7 +66,18 @@ class ExperimentConfig(BaseSettings):
 
     @property
     def output_filename(self) -> str:
-        """Generate output filename from config."""
+        """Generate output filename from config.
+
+        Reuses an existing file matching the experiment_id (for resume support).
+        Creates a new timestamped filename only on first run.
+        """
         model_short = self.model.replace("/", "_")
         dataset_short = self.dataset.replace("/", "_")
-        return f"{model_short}_{dataset_short}_{self.split}_{self.experiment_id}.jsonl"
+        prefix = f"{model_short}_{dataset_short}_{self.split}_{self.experiment_id}"
+        # Look for an existing file to resume into.
+        pattern = f"{self.output_dir}/{prefix}_*.jsonl"
+        existing = sorted(glob.glob(pattern))
+        if existing:
+            return Path(existing[-1]).name
+        ts = int(time.time())
+        return f"{prefix}_{ts}.jsonl"

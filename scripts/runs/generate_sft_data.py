@@ -464,7 +464,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         from controllability.inference.tinker_client import TinkerClient
         base_client = TinkerClient(
             model=args.base_model,
-            reasoning_effort=args.reasoning_effort or "high",
+            reasoning_effort=args.reasoning_effort or "none",
         )
     else:
         print(f"ERROR: Unknown backend: {args.backend}")

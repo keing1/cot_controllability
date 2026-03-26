@@ -16,7 +16,7 @@ async def _single_with_retry(
     request: InferenceRequest,
     semaphore: asyncio.Semaphore,
     max_retries: int,
-    sample_timeout: float | None = 720,
+    sample_timeout: float | None = 1200,
 ) -> InferenceResponse:
     """Execute a single request with semaphore and exponential backoff retry.
 

@@ -43,6 +43,7 @@ class ExperimentConfig(BaseSettings):
     model_path: str | None = None  # Tinker checkpoint path (tinker://...)
     reasoning_effort: str = "high"  # Reasoning effort for gpt-oss models
     request_timeout: int = 300  # Per-request timeout in seconds (not in experiment_id)
+    analysis_channel: bool = False  # Use "analysis channel" instead of "reasoning" in ReasonIF prompts
 
     @property
     def experiment_id(self) -> str:
@@ -59,6 +60,7 @@ class ExperimentConfig(BaseSettings):
                 "n_samples": self.n_samples,
                 "model_path": self.model_path,
                 "reasoning_effort": self.reasoning_effort,
+                "analysis_channel": self.analysis_channel,
             },
             sort_keys=True,
         )

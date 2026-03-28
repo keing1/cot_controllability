@@ -41,6 +41,7 @@ class ModelEvalSpec:
     seed: int = 42
     datasets: list[str] | None = None  # default: ["reasonif", "cotcontrol"]
     cotcontrol_n_samples: int = 100
+    analysis_channel: bool = False  # Use "analysis channel" terminology for ReasonIF
 
 
 async def run_model_eval(spec: ModelEvalSpec) -> list[Path]:
@@ -63,6 +64,9 @@ async def run_model_eval(spec: ModelEvalSpec) -> list[Path]:
         # ReasonIF: all 300 samples; CoTControl: n_samples subset
         n_samples = None if family == "reasonif" else spec.cotcontrol_n_samples
 
+        # analysis_channel only applies to reasonif evals
+        use_ac = spec.analysis_channel and family == "reasonif"
+
         config = ExperimentConfig(
             model=spec.model,
             dataset=dataset,
@@ -79,6 +83,7 @@ async def run_model_eval(spec: ModelEvalSpec) -> list[Path]:
             reasoning_effort=spec.reasoning_effort,
             request_timeout=spec.request_timeout,
             n_samples=n_samples,
+            analysis_channel=use_ac,
         )
 
         output_path = Path(config.output_dir) / config.output_filename

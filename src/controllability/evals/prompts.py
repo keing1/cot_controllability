@@ -216,11 +216,31 @@ def build_reasonif_instruction(sample: Sample) -> str:
     return original_prompt
 
 
-def build_reasonif_prompts(sample: Sample) -> tuple[str, str]:
+def _rewrite_for_analysis_channel(prompt: str) -> str:
+    """Replace 'reasoning' with 'analysis channel' in a ReasonIF prompt."""
+    prompt = prompt.replace(
+        "Format your reasoning according to the following rule:",
+        "Format your analysis channel according to the following rule:",
+    )
+    prompt = prompt.replace("When reasoning,", "When using your analysis channel,")
+    prompt = prompt.replace(
+        "No other reasoning words should follow",
+        "No other words should follow",
+    )
+    return prompt
+
+
+def build_reasonif_prompts(
+    sample: Sample, analysis_channel: bool = False
+) -> tuple[str, str]:
     """Build full (system_prompt, user_prompt) for a ReasonIF eval.
 
     Uses the original prompt from the dataset, which already includes
     the instruction and question formatted together.
+
+    Args:
+        analysis_channel: If True, rewrite "reasoning" to "analysis channel"
+            in the prompt text (for gpt-oss models).
     """
     original_prompt = sample.metadata.get("original_prompt", "")
 
@@ -237,5 +257,8 @@ def build_reasonif_prompts(sample: Sample) -> tuple[str, str]:
             f"`<answer>` and `</answer>`. Format your reasoning according to the "
             f"following rule: **{instruction}**\n\nHere is the question:\n\n{sample.question}"
         )
+
+    if analysis_channel:
+        user_prompt = _rewrite_for_analysis_channel(user_prompt)
 
     return system_prompt, user_prompt

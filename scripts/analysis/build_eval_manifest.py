@@ -17,6 +17,7 @@ COLUMNS = [
     "n_rollouts",
     "vendor",
     "reasoning_effort",
+    "analysis_channel",
     "max_tokens",
     "timestamp",
     "file_name",
@@ -67,6 +68,7 @@ for f in sorted(glob.glob("results/rollouts/*.jsonl")):
         n_samples = ""
 
     reasoning_effort = config.get("reasoning_effort", "")
+    analysis_channel = config.get("analysis_channel", False)
     max_tokens = config.get("max_tokens", "")
 
     rows.append({
@@ -77,6 +79,7 @@ for f in sorted(glob.glob("results/rollouts/*.jsonl")):
         "n_rollouts": n_rollouts,
         "vendor": config.get("backend", ""),
         "reasoning_effort": reasoning_effort,
+        "analysis_channel": analysis_channel,
         "max_tokens": max_tokens,
         "timestamp": timestamp,
         "file_name": p.name,

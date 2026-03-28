@@ -6,13 +6,42 @@ Three-stage pipeline:
 2. Apply constraint-specific transforms and verify compliance
 3. Output parquet matching the existing training format
 
+Generation options:
+  --strip-instruction (default): Remove the reasoning instruction from the prompt
+      sent to the model, so it produces unconstrained reasoning. The instruction
+      is then enforced by post-hoc transforms in Stage 2.
+  --no-strip-instruction: Keep the original prompt (including reasoning instruction)
+      as-is when generating. This was the legacy behavior.
+
+  --analysis-channel (default for gpt-oss models): Replace "reasoning" with
+      "analysis channel" in the instruction text and wrapper. The final prompt's
+      instruction reads e.g. "Format your analysis channel according to the
+      following rule: **When using your analysis channel, ...**"
+  --no-analysis-channel: Use "reasoning" terminology for all models.
+
+File naming:
+  - Legacy (--no-strip-instruction, --no-analysis-channel):
+      results/sft/<model>-reasonif-sft.parquet
+  - Stripped, no analysis-channel:
+      results/sft/<model>-reasonif-sft-stripped.parquet
+  - Stripped + analysis-channel:
+      results/sft/<model>-reasonif-sft-stripped-ac.parquet
+
 Usage:
+    # Default (stripped + analysis-channel for gpt-oss):
     python scripts/runs/generate_sft_data.py \
-        --source-parquet external/reasonIF_ft/train-00000-of-00001.parquet \
-        --base-model qwen/qwen3-235b-a22b \
-        --backend openrouter \
-        --output results/sft/qwen3-235b-reasonif-sft.parquet \
-        --max-concurrency 30
+        --base-model openai/gpt-oss-20b \
+        --backend tinker --max-concurrency 30
+
+    # Default (stripped, no analysis-channel for qwen):
+    python scripts/runs/generate_sft_data.py \
+        --base-model qwen/qwen3-8b \
+        --backend openrouter --max-concurrency 30
+
+    # Legacy behavior:
+    python scripts/runs/generate_sft_data.py \
+        --base-model qwen/qwen3-8b --no-strip-instruction \
+        --backend openrouter --max-concurrency 30
 
     # Rule-based only:
     python scripts/runs/generate_sft_data.py \
@@ -59,6 +88,7 @@ from controllability.types import InferenceRequest, Sample
 # short names used in the codebase.
 
 import numpy as np
+import re as _re
 
 # category:name -> short name
 _CONSTRAINT_NAME_MAP = {
@@ -112,6 +142,73 @@ def get_messages(row, column: str = "messages") -> list[dict]:
     if isinstance(raw, np.ndarray):
         raw = raw.tolist()
     return [dict(m) for m in raw] if raw else []
+
+
+# ---------------------------------------------------------------------------
+# Prompt manipulation
+# ---------------------------------------------------------------------------
+
+# Regex matching the full instruction sentence in a ReasonIF prompt:
+#   "Format your reasoning according to the following rule: **...**"
+# This appears between the intro ("Think step-by-step...") and
+# "\n\nHere is the question:" in the original prompt.
+_INSTRUCTION_SENTENCE_RE = _re.compile(
+    r" Format your reasoning according to the following rule: \*\*.*?\*\*"
+)
+
+
+def strip_reasoning_instruction(prompt: str) -> str:
+    """Remove the reasoning-instruction sentence from a ReasonIF prompt.
+
+    Turns e.g.:
+      "Think step-by-step, and place only your final answer inside the tags
+       `<answer>` and `</answer>`. Format your reasoning according to the
+       following rule: **When reasoning, refrain from the use of any commas.**
+
+       Here is the question:
+
+       ..."
+    Into:
+      "Think step-by-step, and place only your final answer inside the tags
+       `<answer>` and `</answer>`.
+
+       Here is the question:
+
+       ..."
+    """
+    return _INSTRUCTION_SENTENCE_RE.sub("", prompt)
+
+
+def rewrite_instruction_for_analysis_channel(prompt: str) -> str:
+    """Replace 'reasoning' with 'analysis channel' in the instruction text.
+
+    Rewrites both the wrapper ("Format your reasoning ...") and the inner
+    instruction ("When reasoning, ...") to use "analysis channel".
+    """
+    # 1. Wrapper: "Format your reasoning" -> "Format your analysis channel"
+    prompt = prompt.replace(
+        "Format your reasoning according to the following rule:",
+        "Format your analysis channel according to the following rule:",
+    )
+    # 2. Inner instruction: "When reasoning," -> "When using your analysis channel,"
+    prompt = prompt.replace("When reasoning,", "When using your analysis channel,")
+    # 3. Inner phrasing: "No other reasoning words" -> "No other words"
+    #    (appears in end_checker instructions)
+    prompt = prompt.replace(
+        "No other reasoning words should follow",
+        "No other words should follow",
+    )
+    return prompt
+
+
+def rewrite_instruction_description_for_analysis_channel(desc: str) -> str:
+    """Same rewrite as above but for the instruction_description field."""
+    desc = desc.replace("When reasoning,", "When using your analysis channel,")
+    desc = desc.replace(
+        "No other reasoning words should follow",
+        "No other words should follow",
+    )
+    return desc
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +267,16 @@ def build_messages_column(user_prompt: str, reasoning: str, content: str) -> lis
 # Stage 1: Generate raw completions
 # ---------------------------------------------------------------------------
 
+def _get_original_user_prompt(row) -> str:
+    """Extract the original user prompt from a parquet row."""
+    prompt = extract_user_prompt(get_messages(row, "messages_original"))
+    if not prompt:
+        prompt = extract_user_prompt(get_messages(row, "messages"))
+    if not prompt:
+        prompt = str(_unwrap(row.get("original_prompt", "")) or "")
+    return prompt
+
+
 async def stage1_generate(
     df: pd.DataFrame,
     row_indices: list[int],
@@ -181,10 +288,16 @@ async def stage1_generate(
     temperature: float,
     model: str,
     system_prompt: str = "",
+    prompt_fn: callable = None,
 ) -> dict[int, dict]:
     """Generate raw completions from the base model.
 
-    Returns {row_idx: {row_idx, reasoning, content, error}}.
+    Args:
+        prompt_fn: Optional callable(original_prompt: str) -> str that transforms
+            the user prompt before sending to the model (e.g. stripping instruction).
+            If None, the original prompt is used as-is.
+
+    Returns {row_idx: {row_idx, reasoning, content, error, generation_prompt}}.
     """
     # Load existing checkpoint
     completed = load_checkpoint(checkpoint_path)
@@ -199,19 +312,19 @@ async def stage1_generate(
     # Build inference requests
     requests: list[InferenceRequest] = []
     request_indices: list[int] = []
+    generation_prompts: list[str] = []
 
     for idx in pending_indices:
         row = df.iloc[idx]
-        user_prompt = extract_user_prompt(get_messages(row, "messages_original"))
-        if not user_prompt:
-            user_prompt = extract_user_prompt(get_messages(row, "messages"))
-        if not user_prompt:
-            user_prompt = str(_unwrap(row.get("original_prompt", "")) or "")
+        user_prompt = _get_original_user_prompt(row)
+
+        # Apply prompt transformation (e.g. strip instruction)
+        generation_prompt = prompt_fn(user_prompt) if prompt_fn else user_prompt
 
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": user_prompt})
+        messages.append({"role": "user", "content": generation_prompt})
         requests.append(InferenceRequest(
             messages=messages,
             model=model,
@@ -219,6 +332,7 @@ async def stage1_generate(
             temperature=temperature,
         ))
         request_indices.append(idx)
+        generation_prompts.append(generation_prompt)
 
     # Run batch
     responses = await run_batch(
@@ -229,12 +343,13 @@ async def stage1_generate(
     )
 
     # Save results to checkpoint
-    for idx, resp in zip(request_indices, responses):
+    for idx, resp, gen_prompt in zip(request_indices, responses, generation_prompts):
         record = {
             "row_idx": idx,
             "reasoning": resp.reasoning,
             "content": resp.content,
             "error": resp.error,
+            "generation_prompt": gen_prompt,
         }
         completed[idx] = record
         append_checkpoint(checkpoint_path, record)
@@ -249,18 +364,31 @@ async def stage1_generate(
 # Stage 2: Transform + verify
 # ---------------------------------------------------------------------------
 
+MAX_TRANSFORM_RETRIES = 3
+
+
 async def stage2_transform_and_verify(
     df: pd.DataFrame,
     row_indices: list[int],
     completions: dict[int, dict],
     llm_client,
+    use_analysis_channel: bool = False,
 ) -> list[dict]:
     """Apply transforms and verify compliance.
+
+    Retries up to MAX_TRANSFORM_RETRIES times per row if the transform produces
+    a non-compliant result (only relevant for LLM-based transforms).
+
+    Args:
+        use_analysis_channel: If True, rewrite the instruction text in the final
+            user prompt and instruction_description to use "analysis channel"
+            instead of "reasoning".
 
     Returns list of result dicts with all fields needed for the output parquet.
     """
     results = []
     compliance_counts: dict[str, dict[str, int]] = {}
+    retry_counts: dict[str, int] = {}  # constraint_name -> total retries used
 
     for idx in row_indices:
         row = df.iloc[idx]
@@ -284,24 +412,66 @@ async def stage2_transform_and_verify(
 
         reasoning = completion["reasoning"]
         content = completion["content"]
+        generation_prompt = completion.get("generation_prompt", "")
 
-        # Parse constraint_args and filter None values
-        raw_args_dict = get_constraint_args_dict(row)
-        constraint_args = filter_constraint_args(raw_args_dict)
+        # Transform + verify with retries
+        transformed_reasoning = None
+        constraint_args = None
+        compliant = False
+        last_error = None
 
-        # Apply transform to the reasoning
-        try:
-            transformed_reasoning = await apply_transform(
-                constraint_name, reasoning, constraint_args, llm_client
+        for attempt in range(1, MAX_TRANSFORM_RETRIES + 1):
+            # Re-parse constraint_args each attempt (transform may mutate in place)
+            raw_args_dict = get_constraint_args_dict(row)
+            constraint_args = filter_constraint_args(raw_args_dict)
+
+            try:
+                transformed_reasoning = await apply_transform(
+                    constraint_name, reasoning, constraint_args, llm_client
+                )
+            except Exception as e:
+                last_error = f"Transform failed: {e}"
+                continue
+
+            # Verify compliance
+            sample = Sample(
+                id=str(idx),
+                dataset="reasonif",
+                question="",
+                correct_answer="",
+                metadata={
+                    "instruction_type": constraint_name,
+                    "constraint_args": constraint_args,
+                },
             )
-        except Exception as e:
+            grading_result = grade_reasonif_compliance(transformed_reasoning, sample)
+            compliant = grading_result.get("compliant", False)
+
+            if compliant:
+                break
+            # Non-compliant — retry if attempts remain
+            retry_counts[constraint_name] = retry_counts.get(constraint_name, 0) + 1
+
+        # Handle case where all attempts failed with exceptions
+        if transformed_reasoning is None:
             compliance_counts[constraint_name]["error"] += 1
             results.append({
                 "row_idx": idx,
-                "error": f"Transform failed: {e}",
+                "error": last_error or "Transform failed after retries",
                 "compliant": None,
             })
             continue
+
+        # number_words: force compliance via hard truncation if still over limit
+        if not compliant and constraint_name == "number_words" and "num_words" in constraint_args:
+            from controllability.training.transforms import _truncate_to_word_limit
+            transformed_reasoning = _truncate_to_word_limit(
+                transformed_reasoning, int(constraint_args["num_words"]) - 1
+            )
+            compliant = True
+
+        if compliant:
+            compliance_counts[constraint_name]["compliant"] += 1
 
         # For number_words: constraint_args["num_words"] was updated in place by the transform
         # Also update instruction_description
@@ -310,29 +480,23 @@ async def stage2_transform_and_verify(
             actual_target = constraint_args["num_words"]
             instruction_description = f"When reasoning, respond with less than {actual_target} words."
 
-        # Verify compliance using the grading function
-        sample = Sample(
-            id=str(idx),
-            dataset="reasonif",
-            question="",
-            correct_answer="",
-            metadata={
-                "instruction_type": constraint_name,
-                "constraint_args": constraint_args,
-            },
-        )
-        grading_result = grade_reasonif_compliance(transformed_reasoning, sample)
-        compliant = grading_result.get("compliant", False)
+        # Build user prompt (the final prompt stored in the SFT data, with instruction)
+        user_prompt = _get_original_user_prompt(row)
 
-        if compliant:
-            compliance_counts[constraint_name]["compliant"] += 1
+        # For number_words: also rewrite the threshold in the prompt text
+        if constraint_name == "number_words" and "num_words" in constraint_args:
+            user_prompt = _re.sub(
+                r"less than \d+ words",
+                f"less than {int(constraint_args['num_words'])} words",
+                user_prompt,
+            )
 
-        # Build user prompt from original messages
-        user_prompt = extract_user_prompt(get_messages(row, "messages_original"))
-        if not user_prompt:
-            user_prompt = extract_user_prompt(get_messages(row, "messages"))
-        if not user_prompt:
-            user_prompt = str(_unwrap(row.get("original_prompt", "")) or "")
+        # Apply analysis-channel rewriting if requested
+        if use_analysis_channel:
+            user_prompt = rewrite_instruction_for_analysis_channel(user_prompt)
+            instruction_description = rewrite_instruction_description_for_analysis_channel(
+                instruction_description
+            )
 
         # Preserve original parquet array format for constraint_name and constraint_args
         raw_constraint_name = row["constraint_name"]  # keep original array format
@@ -342,6 +506,7 @@ async def stage2_transform_and_verify(
         results.append({
             "row_idx": idx,
             "original_prompt": _unwrap(row.get("original_prompt", "")) or "",
+            "generation_prompt": generation_prompt,
             "source": _unwrap(row.get("source", "")) or "",
             "constraint_name": raw_constraint_name,
             "constraint_args": out_constraint_args,
@@ -359,7 +524,9 @@ async def stage2_transform_and_verify(
         good = counts["compliant"]
         errs = counts["error"]
         rate = f"{good / (total - errs):.1%}" if (total - errs) > 0 else "N/A"
-        print(f"    {cname:25s}  {good}/{total - errs} compliant ({rate}), {errs} errors")
+        retries = retry_counts.get(cname, 0)
+        extra = f", {retries} retries" if retries else ""
+        print(f"    {cname:25s}  {good}/{total - errs} compliant ({rate}), {errs} errors{extra}")
 
     return results
 
@@ -381,15 +548,18 @@ def stage3_output(results: list[dict], output_path: Path) -> None:
     # Build DataFrame with exact schema
     records = []
     for r in good:
-        records.append({
+        record = {
             "original_prompt": r["original_prompt"],
+            "generation_prompt": r.get("generation_prompt", ""),
             "source": r["source"],
             "constraint_name": r["constraint_name"],
             "constraint_args": r["constraint_args"],
             "instruction_description": r["instruction_description"],
             "messages": r["messages"],
             "messages_original": r["messages_original"],
-        })
+            "compliant": r.get("compliant"),
+        }
+        records.append(record)
 
     out_df = pd.DataFrame(records)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -431,6 +601,33 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         row_indices = list(range(len(df)))
         print(f"\nUsing all {len(row_indices)} rows")
 
+    # Resolve generation options
+    do_strip = args.strip_instruction
+    do_ac = args.analysis_channel
+    # Auto-enable analysis_channel for gpt-oss when not explicitly set
+    if do_ac is None:
+        do_ac = "gpt-oss" in args.base_model.lower()
+
+    # Build output / checkpoint paths from options if not explicitly provided
+    if args.output is None or args.checkpoint is None:
+        model_short = args.base_model.split("/")[-1].lower()
+        suffix = ""
+        if do_strip:
+            suffix += "-stripped"
+        if do_ac:
+            suffix += "-ac"
+        default_stem = f"{model_short}-reasonif-sft{suffix}"
+        if args.output is None:
+            args.output = f"results/sft/{default_stem}.parquet"
+        if args.checkpoint is None:
+            args.checkpoint = f"results/sft/{default_stem}.checkpoint.jsonl"
+
+    print(f"\nGeneration options:")
+    print(f"  strip_instruction: {do_strip}")
+    print(f"  analysis_channel:  {do_ac}")
+    print(f"  output:            {args.output}")
+    print(f"  checkpoint:        {args.checkpoint}")
+
     if args.dry_run:
         print("\n[DRY RUN] Would process:")
         names = [c.strip() for c in args.constraints.split(",")] if args.constraints else list(constraint_dist.index)
@@ -444,8 +641,15 @@ async def run_pipeline(args: argparse.Namespace) -> None:
             print(f"System prompt: {args.system_prompt!r}")
         if args.reasoning_effort:
             print(f"Reasoning effort: {args.reasoning_effort}")
-        print(f"Output: {args.output}")
-        print(f"Checkpoint: {args.checkpoint}")
+        # Show example of what stripping does
+        if do_strip and len(df) > 0:
+            example_prompt = _get_original_user_prompt(df.iloc[0])
+            stripped = strip_reasoning_instruction(example_prompt)
+            print(f"\nExample prompt transform (first row):")
+            print(f"  Original:  {example_prompt[:120]}...")
+            print(f"  Stripped:  {stripped[:120]}...")
+        if do_ac:
+            print(f"\n  analysis_channel: will rewrite 'reasoning' -> 'analysis channel' in final prompts")
         return
 
     # Create inference clients
@@ -488,10 +692,15 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     checkpoint_path = Path(args.checkpoint)
     output_path = Path(args.output)
 
+    # Build prompt_fn for Stage 1
+    prompt_fn = strip_reasoning_instruction if do_strip else None
+
     try:
         # Stage 1: Generate raw completions
         print("\n" + "=" * 60)
         print("STAGE 1: Generate raw completions")
+        if do_strip:
+            print("  (reasoning instruction STRIPPED from generation prompt)")
         print("=" * 60)
         completions = await stage1_generate(
             df=df,
@@ -504,17 +713,21 @@ async def run_pipeline(args: argparse.Namespace) -> None:
             temperature=args.temperature,
             model=args.base_model,
             system_prompt=args.system_prompt or "",
+            prompt_fn=prompt_fn,
         )
 
         # Stage 2: Transform + verify
         print("\n" + "=" * 60)
         print("STAGE 2: Transform + verify compliance")
+        if do_ac:
+            print("  (analysis channel terminology enabled)")
         print("=" * 60)
         results = await stage2_transform_and_verify(
             df=df,
             row_indices=row_indices,
             completions=completions,
             llm_client=llm_client,
+            use_analysis_channel=do_ac,
         )
 
         # Stage 3: Output
@@ -560,8 +773,8 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default="results/sft/qwen3-235b-reasonif-sft.parquet",
-        help="Output parquet path",
+        default=None,
+        help="Output parquet path (auto-computed from model + options if not set)",
     )
     parser.add_argument(
         "--max-concurrency",
@@ -589,8 +802,8 @@ def main():
     )
     parser.add_argument(
         "--checkpoint",
-        default="results/sft/qwen3-235b-reasonif-sft.checkpoint.jsonl",
-        help="Checkpoint JSONL path for resume support",
+        default=None,
+        help="Checkpoint JSONL path for resume (auto-computed from model + options if not set)",
     )
     parser.add_argument(
         "--constraints",
@@ -614,6 +827,38 @@ def main():
         default=None,
         help="Reasoning effort level for models that support it (gpt-oss, o1, o3, o4)",
     )
+
+    # Generation options
+    strip_group = parser.add_mutually_exclusive_group()
+    strip_group.add_argument(
+        "--strip-instruction",
+        action="store_true",
+        default=True,
+        dest="strip_instruction",
+        help="Strip reasoning instruction from prompt before generation (default)",
+    )
+    strip_group.add_argument(
+        "--no-strip-instruction",
+        action="store_false",
+        dest="strip_instruction",
+        help="Keep original prompt (including instruction) during generation (legacy)",
+    )
+
+    ac_group = parser.add_mutually_exclusive_group()
+    ac_group.add_argument(
+        "--analysis-channel",
+        action="store_true",
+        default=None,
+        dest="analysis_channel",
+        help="Use 'analysis channel' terminology (default for gpt-oss models)",
+    )
+    ac_group.add_argument(
+        "--no-analysis-channel",
+        action="store_false",
+        dest="analysis_channel",
+        help="Use 'reasoning' terminology for all models",
+    )
+
     parser.add_argument(
         "--dry-run",
         action="store_true",

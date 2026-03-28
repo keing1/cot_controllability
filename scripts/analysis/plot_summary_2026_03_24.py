@@ -291,6 +291,89 @@ def make_plot(data):
     print(f"Saved: {out_path}")
 
 
+def make_plot_meta_discussion(data):
+    """Base vs FT (step 60) grouped bar plot for meta discussion rate."""
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+    bar_width = 0.32
+    x = np.arange(len(MODELS))
+    colors = {"base": "#78909C", "ft": "#1E88E5"}
+
+    for ax_idx, eval_type in enumerate(EVAL_TYPES):
+        ax = axes[ax_idx]
+
+        base_vals, base_errs = [], []
+        ft_vals, ft_errs = [], []
+
+        for m_cfg in MODELS:
+            model = m_cfg["model"]
+            key = (model, eval_type)
+
+            base_row = data[key]["base"]
+            if base_row:
+                p = sf(base_row, "meta_discussion_rate")
+                n = si(base_row, "n_clean")
+                base_vals.append((p or 0) * 100)
+                base_errs.append(ci80(p, n) * 100)
+            else:
+                base_vals.append(0)
+                base_errs.append(0)
+
+            ft_row = data[key]["ft"]
+            if ft_row:
+                p = sf(ft_row, "meta_discussion_rate")
+                n = si(ft_row, "n_clean")
+                ft_vals.append((p or 0) * 100)
+                ft_errs.append(ci80(p, n) * 100)
+            else:
+                ft_vals.append(0)
+                ft_errs.append(0)
+
+        bars_base = ax.bar(
+            x - bar_width / 2, base_vals, bar_width,
+            yerr=base_errs, capsize=3,
+            color=colors["base"], alpha=0.85, label="Base",
+            error_kw={"linewidth": 1},
+        )
+        bars_ft = ax.bar(
+            x + bar_width / 2, ft_vals, bar_width,
+            yerr=ft_errs, capsize=3,
+            color=colors["ft"], alpha=0.85, label="FT (step 60)",
+            error_kw={"linewidth": 1},
+        )
+
+        for bars, errs in [(bars_base, base_errs), (bars_ft, ft_errs)]:
+            for bar, err in zip(bars, errs):
+                height = bar.get_height()
+                if height > 0:
+                    ax.annotate(
+                        f"{height:.1f}",
+                        xy=(bar.get_x() + bar.get_width() / 2, height + err),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha="center", va="bottom",
+                        fontsize=8, fontweight="bold",
+                    )
+
+        ax.set_title(EVAL_DISPLAY[eval_type], fontsize=13, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels([m["label"] for m in MODELS], rotation=20, ha="right", fontsize=9)
+        ax.set_ylabel("Meta Discussion Rate (%)" if ax_idx == 0 else "")
+        ax.legend(fontsize=9, loc="upper right")
+        ax.set_ylim(0, None)
+        ax.grid(axis="y", alpha=0.3)
+
+    fig.suptitle(
+        "Meta Discussion Rate: Base vs Fine-Tuned (80% CI)",
+        fontsize=14, fontweight="bold",
+    )
+    fig.tight_layout()
+
+    out_path = OUTDIR / "base_vs_ft_lr1e-4_step60_meta_discussion.png"
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # Training curve data + plot
 # ---------------------------------------------------------------------------
@@ -419,6 +502,75 @@ def make_training_curve_plot(data):
     fig.tight_layout()
 
     out_path = OUTDIR / "ft_training_curve_lr1e-4_compliance.png"
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def make_training_curve_meta_discussion_plot(data):
+    """Meta discussion rate over fine-tuning checkpoints for all 4 models."""
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+    for ax_idx, eval_type in enumerate(EVAL_TYPES):
+        ax = axes[ax_idx]
+
+        for m_cfg in MODELS:
+            model = m_cfg["model"]
+            key = (model, eval_type)
+            color = MODEL_COLORS[model]
+
+            xs = []
+            vals = []
+            errs = []
+
+            # Base at x=0
+            base_row = data[key]["base"]
+            if base_row:
+                p = sf(base_row, "meta_discussion_rate")
+                n = si(base_row, "n_clean")
+                xs.append(0)
+                vals.append((p or 0) * 100)
+                errs.append(ci80(p, n) * 100)
+
+            # Checkpoints
+            for i, ckpt in enumerate(FT_CKPTS):
+                row = data[key]["ckpts"].get(ckpt)
+                if row:
+                    p = sf(row, "meta_discussion_rate")
+                    n = si(row, "n_clean")
+                    xs.append(i + 1)
+                    vals.append((p or 0) * 100)
+                    errs.append(ci80(p, n) * 100)
+
+            ax.errorbar(
+                xs, vals, yerr=errs,
+                fmt="o-", color=color, capsize=3,
+                label=m_cfg["label"],
+                linewidth=1.5, markersize=5,
+                elinewidth=1,
+            )
+
+        tick_positions = [0] + list(range(1, len(FT_CKPTS) + 1))
+        tick_labels = ["base"] + [FT_CKPT_DISPLAY[c] for c in FT_CKPTS]
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, fontsize=9)
+        ax.set_xlabel("Batch", fontsize=10)
+        ax.set_ylabel("Meta Discussion Rate (%)" if ax_idx == 0 else "")
+        ax.set_title(EVAL_DISPLAY[eval_type], fontsize=13, fontweight="bold")
+        ax.set_ylim(0, None)
+        ax.grid(axis="y", alpha=0.3)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=9,
+               bbox_to_anchor=(0.5, -0.04))
+
+    fig.suptitle(
+        "Meta Discussion Rate over Fine-Tuning (80% CI)",
+        fontsize=14, fontweight="bold",
+    )
+    fig.tight_layout()
+
+    out_path = OUTDIR / "ft_training_curve_lr1e-4_meta_discussion.png"
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
@@ -1271,10 +1423,12 @@ def main():
             print(f"{m_cfg['label']:<25s} {eval_type:<12s} {base_str:>10s} {ft_str:>10s}")
 
     make_plot(data)
+    make_plot_meta_discussion(data)
 
-    # Training curve plot
+    # Training curve plots
     tc_data = load_training_curve_data()
     make_training_curve_plot(tc_data)
+    make_training_curve_meta_discussion_plot(tc_data)
 
     # Effort sweep plot
     base_effort, ft_effort = load_effort_sweep_data()

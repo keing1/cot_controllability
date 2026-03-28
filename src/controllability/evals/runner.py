@@ -57,13 +57,17 @@ def _create_client(config: ExperimentConfig, settings: Settings) -> InferenceCli
 
 
 def _build_prompts(
-    mode_name: str, sample: Sample, model_name: str, adversarial_pressure: str
+    mode_name: str,
+    sample: Sample,
+    model_name: str,
+    adversarial_pressure: str,
+    analysis_channel: bool = False,
 ) -> tuple[str, str]:
     """Build (system_prompt, user_prompt) for a given mode and sample."""
     mode = get_mode(mode_name)
 
     if mode.source == "reasonif":
-        return build_reasonif_prompts(sample)
+        return build_reasonif_prompts(sample, analysis_channel=analysis_channel)
     else:
         return build_cotcontrol_prompts(
             mode=mode_name,
@@ -154,7 +158,8 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
 
             for sample in pending_samples:
                 sys_prompt, usr_prompt = _build_prompts(
-                    mode_name, sample, config.model, config.adversarial_pressure
+                    mode_name, sample, config.model, config.adversarial_pressure,
+                    analysis_channel=config.analysis_channel,
                 )
 
                 messages = []

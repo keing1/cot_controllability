@@ -42,6 +42,20 @@ class FileMetadata:
     lr: str           # "" if not fine-tuned
     checkpoint: str   # "" if not fine-tuned
     provider: str     # e.g. "openai", "qwen"
+    reasoning_effort: str  # from header, e.g. "medium", "none", ""
+    max_tokens: str        # from header, e.g. "28000", ""
+
+
+def _read_header_quick(path: Path) -> dict:
+    """Read just the first line header from a JSONL file."""
+    try:
+        with open(path, "r") as f:
+            line = f.readline().strip()
+            if line.startswith("# "):
+                return json.loads(line[2:])
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
 
 
 def parse_filename(path: Path) -> FileMetadata | None:
@@ -74,6 +88,11 @@ def parse_filename(path: Path) -> FileMetadata | None:
         checkpoint = ""
         is_ft = False
 
+    # Read header for reasoning_effort and max_tokens
+    hdr = _read_header_quick(path)
+    reasoning_effort = str(hdr.get("reasoning_effort", "") or "")
+    max_tokens = str(hdr.get("max_tokens", "") or "")
+
     return FileMetadata(
         path=path,
         filename=path.name,
@@ -83,6 +102,8 @@ def parse_filename(path: Path) -> FileMetadata | None:
         lr=lr,
         checkpoint=checkpoint,
         provider=provider,
+        reasoning_effort=reasoning_effort,
+        max_tokens=max_tokens,
     )
 
 
@@ -241,6 +262,18 @@ with st.sidebar:
                 for m in filtered
                 if not m.is_ft or not m.checkpoint or m.checkpoint in sel_ckpts
             ]
+
+    # Reasoning effort filter
+    all_efforts = sorted({m.reasoning_effort for m in filtered})
+    if len(all_efforts) > 1:
+        sel_efforts = st.multiselect("Reasoning Effort", all_efforts, default=all_efforts)
+        filtered = [m for m in filtered if m.reasoning_effort in sel_efforts]
+
+    # Max tokens filter
+    all_max_tokens = sorted({m.max_tokens for m in filtered})
+    if len(all_max_tokens) > 1:
+        sel_max_tokens = st.multiselect("Max Tokens", all_max_tokens, default=all_max_tokens)
+        filtered = [m for m in filtered if m.max_tokens in sel_max_tokens]
 
     # Sort: model, dataset, lr, checkpoint
     filtered.sort(key=lambda m: (m.model, m.dataset, m.lr, m.checkpoint, m.filename))

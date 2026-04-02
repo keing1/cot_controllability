@@ -68,7 +68,13 @@ for f in sorted(glob.glob("results/rollouts/*.jsonl")):
         n_samples = ""
 
     reasoning_effort = config.get("reasoning_effort", "")
-    analysis_channel = config.get("analysis_channel", False)
+    dataset = config.get("dataset", "")
+    dataset_family = dataset.split("/")[0]
+    # analysis_channel only applies to reasonif evals
+    if dataset_family == "reasonif":
+        analysis_channel = config.get("analysis_channel", False)
+    else:
+        analysis_channel = ""
     max_tokens = config.get("max_tokens", "")
 
     rows.append({

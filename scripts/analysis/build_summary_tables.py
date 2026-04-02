@@ -144,6 +144,7 @@ MANIFEST_COLS = [
     "n_rollouts",
     "vendor",
     "reasoning_effort",
+    "analysis_channel",
     "max_tokens",
     "timestamp",
     "file_name",

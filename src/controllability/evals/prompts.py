@@ -29,17 +29,45 @@ from prompts import (  # noqa: E402
 # Control values per CoTControl mode
 # ---------------------------------------------------------------------------
 
-def _get_cotcontrol_control_value(mode: str, sample: Sample) -> str:
-    """Get the control_value for a CoTControl mode given a sample."""
+def _get_cotcontrol_control_value(
+    mode: str, sample: Sample, *, include_synonyms: bool = False,
+) -> str:
+    """Get the control_value for a CoTControl mode given a sample.
+
+    Args:
+        include_synonyms: If True, append synonyms to the value for
+            word_suppression / multiple_word_suppression (matching
+            the original CoTControl paper).  Default False — only
+            the bare keyword(s) are shown to the model.
+    """
     metadata = sample.metadata
 
     if mode == "word_suppression":
         keywords = metadata.get("keywords", [])
-        return keywords[0] if keywords else ""
+        if not keywords:
+            return ""
+        keyword = keywords[0]
+        if include_synonyms:
+            synonyms_map = metadata.get("synonyms_map", {})
+            synonyms = synonyms_map.get(keyword, [])
+            if synonyms:
+                return f"{keyword}' or its synonyms: '{synonyms}"
+        return keyword
 
     if mode == "multiple_word_suppression":
         keywords = metadata.get("keywords", [])
-        return ", ".join(keywords) if keywords else ""
+        if not keywords:
+            return ""
+        if include_synonyms:
+            synonyms_map = metadata.get("synonyms_map", {})
+            all_synonyms = []
+            for kw in keywords:
+                all_synonyms.extend(synonyms_map.get(kw, []))
+            keyword_str = ", ".join(keywords)
+            if all_synonyms:
+                return f"{keyword_str}' or its synonyms: '{all_synonyms}"
+            return keyword_str
+        return ", ".join(keywords)
 
     if mode == "repeat_sentences":
         return REPEAT_SENTENCE_TARGET
@@ -58,7 +86,10 @@ def _get_cotcontrol_control_value(mode: str, sample: Sample) -> str:
 # CoTControl prompt building
 # ---------------------------------------------------------------------------
 
-def build_cotcontrol_instruction(mode: str, sample: Sample, model_name: str = "") -> str:
+def build_cotcontrol_instruction(
+    mode: str, sample: Sample, model_name: str = "",
+    *, include_synonyms: bool = False,
+) -> str:
     """Build the instruction text for a CoTControl mode.
 
     Returns just the requirement/instruction text (not the full prompt).
@@ -66,7 +97,9 @@ def build_cotcontrol_instruction(mode: str, sample: Sample, model_name: str = ""
     if mode == "baseline":
         return ""
 
-    control_value = _get_cotcontrol_control_value(mode, sample)
+    control_value = _get_cotcontrol_control_value(
+        mode, sample, include_synonyms=include_synonyms,
+    )
     reasoning_term = "analysis channel" if "gpt-oss" in model_name.lower() else "reasoning stage"
 
     template = CONTROL_TYPE_REQUIREMENTS.get(mode, "")
@@ -80,6 +113,8 @@ def build_cotcontrol_prompts(
     sample: Sample,
     model_name: str = "",
     adversarial_pressure: str = "none",
+    *,
+    include_synonyms: bool = False,
 ) -> tuple[str, str]:
     """Build full (system_prompt, user_prompt) for a CoTControl eval.
 
@@ -98,7 +133,9 @@ def build_cotcontrol_prompts(
         user_prompt = f"Question: {sample.question}{choices_formatted}{format_instruction}"
         return system_prompt, user_prompt
 
-    control_value = _get_cotcontrol_control_value(mode, sample)
+    control_value = _get_cotcontrol_control_value(
+        mode, sample, include_synonyms=include_synonyms,
+    )
 
     system_prompt, user_prompt = _cc_create_prompt(
         question=sample.question,

@@ -315,12 +315,21 @@ def _get_spec_by_short_name(name: str) -> FTModelSpec:
 
 
 def _checkpoint_step_key(name: str) -> int:
-    """Extract numeric step from checkpoint name for sorting, e.g. 'step_60' -> 60."""
+    """Extract numeric step from checkpoint name for sorting, e.g. '000060' -> 60.
+
+    'final' sorts last (after all numbered checkpoints).
+    """
+    if name == "final":
+        return 999999
     parts = name.split("_")
     for part in reversed(parts):
         if part.isdigit():
             return int(part)
-    return 0
+    # Try the whole name as a zero-padded number (e.g. "000060")
+    try:
+        return int(name)
+    except ValueError:
+        return 999999
 
 
 # --------------------------------------------------------------------------- #
@@ -406,8 +415,9 @@ def do_single_eval(spec: FTModelSpec, checkpoint_name: str, sampler_path: str,
 
     model_short = model_label.replace("/", "_")
     dataset_short = eval_dataset.replace("/", "_")
+    ac_suffix = "_ac" if use_ac else ""
     custom_filename = (
-        f"{model_short}_{dataset_short}_all"
+        f"{model_short}_{dataset_short}{ac_suffix}_all"
         f"_{run_id}_{config.experiment_id}.jsonl"
     )
     output_path = Path(output_dir) / custom_filename
@@ -556,6 +566,16 @@ def run_pool(specs: list[FTModelSpec], run_id: str, eval_only: bool) -> dict[str
             job = eval_queue.pop(0)
             proc, log_file = _launch_job(job)
             active[job.key] = (proc, log_file, job)
+
+    # In eval-only mode, pre-populate the eval queue before entering loop
+    if eval_only and completed_models:
+        for spec in specs:
+            if spec.short_name in completed_models and spec.short_name not in evals_queued_for:
+                new_jobs = _build_eval_jobs(spec, completed_models[spec.short_name])
+                _merge_eval_jobs(new_jobs)
+                evals_queued_for.add(spec.short_name)
+                print(f"    -> Queued {len(new_jobs)} eval jobs for {spec.short_name}")
+        _try_launch_evals()
 
     # Main poll loop
     while active or eval_queue:

@@ -35,15 +35,15 @@ class ControlMode:
 def _cc_build_instruction(mode: str) -> Callable[[Sample, str], str]:
     """Create an instruction builder for a CoTControl mode."""
     from controllability.evals.prompts import build_cotcontrol_instruction
-    def builder(sample: Sample, model_name: str = "") -> str:
-        return build_cotcontrol_instruction(mode, sample, model_name)
+    def builder(sample: Sample, model_name: str = "", *, include_synonyms: bool = False) -> str:
+        return build_cotcontrol_instruction(mode, sample, model_name, include_synonyms=include_synonyms)
     return builder
 
 
 def _cc_grade(mode: str) -> Callable[[str, Sample], dict]:
     """Create a compliance grader for a CoTControl mode."""
-    def grader(reasoning: str, sample: Sample) -> dict:
-        return grade_cotcontrol_compliance(mode, reasoning, sample)
+    def grader(reasoning: str, sample: Sample, *, check_synonyms: bool = False) -> dict:
+        return grade_cotcontrol_compliance(mode, reasoning, sample, check_synonyms=check_synonyms)
     return grader
 
 

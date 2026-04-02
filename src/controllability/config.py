@@ -44,6 +44,7 @@ class ExperimentConfig(BaseSettings):
     reasoning_effort: str = "high"  # Reasoning effort for gpt-oss models
     request_timeout: int = 300  # Per-request timeout in seconds (not in experiment_id)
     analysis_channel: bool = False  # Use "analysis channel" instead of "reasoning" in ReasonIF prompts
+    word_suppression_synonyms: bool = False  # Include synonyms in word_suppression prompt & grading (paper mode)
 
     @property
     def experiment_id(self) -> str:
@@ -61,6 +62,7 @@ class ExperimentConfig(BaseSettings):
                 "model_path": self.model_path,
                 "reasoning_effort": self.reasoning_effort,
                 "analysis_channel": self.analysis_channel,
+                "word_suppression_synonyms": self.word_suppression_synonyms,
             },
             sort_keys=True,
         )

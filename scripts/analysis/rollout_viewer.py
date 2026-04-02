@@ -28,8 +28,8 @@ ROLLOUTS_DIR = Path(__file__).resolve().parents[2] / "results" / "rollouts"
 # Regex splits on _cotcontrol_ or _reasonif_ to separate model part from rest.
 _DATASET_RE = re.compile(r"_(cotcontrol|reasonif)_")
 
-# Fine-tune pattern:  -rif  optionally followed by  -lr<rate>  and  -<checkpoint>
-_FT_RE = re.compile(r"-rif(?:-lr([\d.]+e-\d+))?(?:-(\d{3,}|final))?$")
+# Fine-tune pattern:  -rif  optionally -stripped  optionally -lr<rate>  and  -<checkpoint>
+_FT_RE = re.compile(r"-rif(?:-(stripped))?(?:-lr([\d.]+e-\d+))?(?:-(\d{3,}|final))?$")
 
 
 @dataclass
@@ -39,11 +39,13 @@ class FileMetadata:
     model: str        # e.g. "gpt-oss-120b" or "qwen3-8b"
     dataset: str      # "cotcontrol" or "reasonif"
     is_ft: bool
+    is_stripped: bool  # True if trained on stripped SFT data
     lr: str           # "" if not fine-tuned
     checkpoint: str   # "" if not fine-tuned
     provider: str     # e.g. "openai", "qwen"
     reasoning_effort: str  # from header, e.g. "medium", "none", ""
     max_tokens: str        # from header, e.g. "28000", ""
+    analysis_channel: str  # "True", "False", or ""
 
 
 def _read_header_quick(path: Path) -> dict:
@@ -78,20 +80,24 @@ def parse_filename(path: Path) -> FileMetadata | None:
     ft = _FT_RE.search(model_full)
     if ft:
         base_model = model_full[: ft.start()]
+        is_stripped = ft.group(1) == "stripped"
         # Old-format filenames (-rif-000060) omit the lr; these were all 1e-4
-        lr = ft.group(1) or ("1e-4" if ft.group(2) else "")
-        checkpoint = ft.group(2) or ""
+        lr = ft.group(2) or ("1e-4" if ft.group(3) else "")
+        checkpoint = ft.group(3) or ""
         is_ft = True
     else:
         base_model = model_full
+        is_stripped = False
         lr = ""
         checkpoint = ""
         is_ft = False
 
-    # Read header for reasoning_effort and max_tokens
+    # Read header for reasoning_effort, max_tokens, analysis_channel
     hdr = _read_header_quick(path)
     reasoning_effort = str(hdr.get("reasoning_effort", "") or "")
     max_tokens = str(hdr.get("max_tokens", "") or "")
+    ac_val = hdr.get("analysis_channel")
+    analysis_channel = str(ac_val) if ac_val is not None else ""
 
     return FileMetadata(
         path=path,
@@ -99,11 +105,13 @@ def parse_filename(path: Path) -> FileMetadata | None:
         model=base_model,
         dataset=dataset,
         is_ft=is_ft,
+        is_stripped=is_stripped,
         lr=lr,
         checkpoint=checkpoint,
         provider=provider,
         reasoning_effort=reasoning_effort,
         max_tokens=max_tokens,
+        analysis_channel=analysis_channel,
     )
 
 
@@ -262,6 +270,22 @@ with st.sidebar:
                 for m in filtered
                 if not m.is_ft or not m.checkpoint or m.checkpoint in sel_ckpts
             ]
+
+    # Stripped filter (only shown if FT files exist)
+    ft_in_view2 = [m for m in filtered if m.is_ft]
+    if ft_in_view2:
+        stripped_filter = st.radio(
+            "SFT Data", ["All", "Stripped only", "Non-stripped only"], horizontal=True
+        )
+        if stripped_filter != "All":
+            want_stripped = stripped_filter == "Stripped only"
+            filtered = [m for m in filtered if m.is_ft and m.is_stripped == want_stripped]
+
+    # Analysis channel filter
+    all_ac = sorted({m.analysis_channel for m in filtered})
+    if len(all_ac) > 1:
+        sel_ac = st.multiselect("Analysis Channel", all_ac, default=all_ac)
+        filtered = [m for m in filtered if m.analysis_channel in sel_ac]
 
     # Reasoning effort filter
     all_efforts = sorted({m.reasoning_effort for m in filtered})

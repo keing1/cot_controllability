@@ -33,6 +33,7 @@ uv.lock
 *.log
 *.csv
 *.png
+*.ipynb
 results/rollouts/
 results/
 notebooks/

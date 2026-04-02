@@ -62,6 +62,7 @@ def _build_prompts(
     model_name: str,
     adversarial_pressure: str,
     analysis_channel: bool = False,
+    include_synonyms: bool = False,
 ) -> tuple[str, str]:
     """Build (system_prompt, user_prompt) for a given mode and sample."""
     mode = get_mode(mode_name)
@@ -74,6 +75,7 @@ def _build_prompts(
             sample=sample,
             model_name=model_name,
             adversarial_pressure=adversarial_pressure,
+            include_synonyms=include_synonyms,
         )
 
 
@@ -160,6 +162,7 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
                 sys_prompt, usr_prompt = _build_prompts(
                     mode_name, sample, config.model, config.adversarial_pressure,
                     analysis_channel=config.analysis_channel,
+                    include_synonyms=config.word_suppression_synonyms,
                 )
 
                 messages = []
@@ -221,7 +224,10 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
                     compliant = None
                     pending_judge.append((idx, resp.reasoning, usr_prompt))
                 else:
-                    grading_result = mode.grade_compliance(resp.reasoning, sample)
+                    grading_result = mode.grade_compliance(
+                        resp.reasoning, sample,
+                        check_synonyms=config.word_suppression_synonyms,
+                    )
                     compliant = grading_result.get("compliant")
 
                 meta = detect_meta_discussion(resp.reasoning) if resp.reasoning else None

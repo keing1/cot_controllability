@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import csv
 import json
+import random
 from pathlib import Path
 
 from controllability.types import Sample
@@ -172,3 +173,53 @@ def _load_reasonif() -> list[Sample]:
         )
         samples.append(sample)
     return samples
+
+
+# ---------------------------------------------------------------------------
+# Monitor QA dataset loader (not in the registry — takes a path)
+# ---------------------------------------------------------------------------
+
+
+def load_monitor_dataset(path: str | Path) -> list[Sample]:
+    """Load a monitor_qa dataset from a JSONL file.
+
+    Each line should be a JSON object with:
+        main_task, side_task, side_task_answer, id (optional), source (optional), metadata (optional)
+
+    Maps to Sample with question=main_task, correct_answer="",
+    and side task info stored in metadata.
+    """
+    path = Path(path)
+    samples = []
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entry = json.loads(line)
+            extra_meta = entry.get("metadata", {})
+            sample_id = entry.get("id", f"mqa_{i}")
+            sample = Sample(
+                id=str(sample_id),
+                dataset="monitor_qa",
+                question=entry["main_task"],
+                correct_answer="",
+                metadata={
+                    "side_task": entry["side_task"],
+                    "side_task_answer": str(entry.get("side_task_answer", "")),
+                    "source": entry.get("source", ""),
+                    **extra_meta,
+                },
+            )
+            samples.append(sample)
+    return samples
+
+
+def subsample_dataset(
+    samples: list[Sample], n: int | None, seed: int = 42,
+) -> list[Sample]:
+    """Randomly subsample a dataset. Returns all samples if n is None or >= len."""
+    if n is None or n >= len(samples):
+        return samples
+    rng = random.Random(seed)
+    return rng.sample(samples, n)

@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     tinker_api_key: str = ""
     openai_api_key: str = ""
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 class ExperimentConfig(BaseSettings):
@@ -41,7 +41,7 @@ class ExperimentConfig(BaseSettings):
     adversarial_pressure: str = "none"
     n_samples: int | None = None
     model_path: str | None = None  # Tinker checkpoint path (tinker://...)
-    reasoning_effort: str = "high"  # Reasoning effort for gpt-oss models
+    reasoning_effort: str = "medium"  # Reasoning effort for gpt-oss models
     request_timeout: int = 300  # Per-request timeout in seconds (not in experiment_id)
     analysis_channel: bool = False  # Use "analysis channel" instead of "reasoning" in ReasonIF prompts
     word_suppression_synonyms: bool = False  # Include synonyms in word_suppression prompt & grading (paper mode)
@@ -79,6 +79,80 @@ class ExperimentConfig(BaseSettings):
         dataset_short = self.dataset.replace("/", "_")
         prefix = f"{model_short}_{dataset_short}_{self.split}_{self.experiment_id}"
         # Look for an existing file to resume into.
+        pattern = f"{self.output_dir}/{prefix}_*.jsonl"
+        existing = sorted(glob.glob(pattern))
+        if existing:
+            return Path(existing[-1]).name
+        ts = int(time.time())
+        return f"{prefix}_{ts}.jsonl"
+
+
+class MonitorQAConfig(BaseSettings):
+    """Configuration for a monitor_qa experiment (actor + monitor pipeline)."""
+
+    model_config = {"extra": "ignore"}
+
+    # Actor model
+    actor_model: str = "qwen/qwen3-8b"
+    actor_backend: Literal["openrouter", "tinker"] = "tinker"
+    actor_max_tokens: int = 28000
+    actor_temperature: float = 1.0
+    actor_concurrency: int = 40
+    actor_max_retries: int = 1
+
+    # Monitor model (non-reasoning)
+    monitor_model: str = "openai/gpt-4o"
+    monitor_max_tokens: int = 1024
+    monitor_temperature: float = 0.0
+    monitor_concurrency: int = 60
+    monitor_max_retries: int = 3
+
+    # Dataset
+    dataset_path: str = "results/monitorqa/gpqa_hle_w_math_monitorqa.jsonl"
+    n_samples: int | None = None
+    seed: int = 42
+
+    # Prompt types
+    prompt_type: str = "default"
+    monitor_types: list[str] = Field(default_factory=lambda: ["metr_note"])
+
+    # Modes
+    modes: list[str] = Field(default_factory=lambda: ["side_task"])
+
+    # Inference settings
+    reasoning_effort: str = "medium"
+    request_timeout: int = 900
+    model_path: str | None = None  # Tinker checkpoint path
+
+    # Output
+    output_dir: str = "results/rollouts/monitor_qa"
+    save_every: int = 100  # Save rollouts to disk every N samples
+
+    @property
+    def experiment_id(self) -> str:
+        """Deterministic experiment ID from config params."""
+        key = json.dumps(
+            {
+                "actor_model": self.actor_model,
+                "monitor_model": self.monitor_model,
+                "dataset_path": self.dataset_path,
+                "modes": sorted(self.modes),
+                "n_samples": self.n_samples,
+                "seed": self.seed,
+                "prompt_type": self.prompt_type,
+                "monitor_types": sorted(self.monitor_types),
+                "model_path": self.model_path,
+                "reasoning_effort": self.reasoning_effort,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+    @property
+    def output_filename(self) -> str:
+        """Generate output filename with resume support."""
+        actor_short = self.actor_model.replace("/", "_")
+        prefix = f"monitor_qa_{actor_short}_{self.experiment_id}"
         pattern = f"{self.output_dir}/{prefix}_*.jsonl"
         existing = sorted(glob.glob(pattern))
         if existing:

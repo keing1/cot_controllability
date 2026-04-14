@@ -542,6 +542,7 @@ async def _run_monitor_streaming(
             experiment_id=config.experiment_id,
             sample=sample,
             model=config.actor_model,
+            model_path=config.model_path,
             mode=mode,
             system_prompt=sys_prompt,
             user_prompt=usr_prompt,

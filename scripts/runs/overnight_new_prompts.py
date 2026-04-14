@@ -297,6 +297,10 @@ def main():
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
 
+    # Pre-import transformers to avoid race condition when threads
+    # try to import simultaneously (lazy import in TinkerClient).
+    from transformers import AutoTokenizer  # noqa: F401
+
     # Build jobs
     jobs = []
     for prompt_type in PROMPT_VARIANTS:

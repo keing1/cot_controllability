@@ -89,6 +89,7 @@ class MonitorRollout(BaseModel):
     experiment_id: str = ""
     sample: Sample
     model: str  # actor model
+    model_path: str | None = None  # Tinker checkpoint path (tinker://...)
     mode: str  # "side_task" or "baseline"
 
     # Actor interaction

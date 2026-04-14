@@ -108,16 +108,16 @@ ALL_VARIANT_COLORS = {**VARIANT_COLORS, **NEW_VARIANT_COLORS}
 
 # Val-split baselines — used for threshold computation
 BASELINE_FILES_BASE = {
-    "GPT-OSS-20B":  "monitor_qa_gpt-oss-20b_baseline_formatted_val_split_20260413_215558_7d9d8b82baae.jsonl",
-    "GPT-OSS-120B": "monitor_qa_gpt-oss-120b_baseline_formatted_val_split_20260413_215558_9a536a6c65fd.jsonl",
-    "Qwen3-8B":     "monitor_qa_qwen3-8b_baseline_formatted_val_split_20260413_215558_f10c3c132c8e.jsonl",
-    "Qwen3-32B":    "monitor_qa_qwen3-32b_baseline_formatted_val_split_20260413_215558_12d4f7dd0458.jsonl",
+    "GPT-OSS-20B":  "monitor_qa_gpt-oss-20b_baseline_val_split_20260414_175620_a025af2725fd.jsonl",
+    "GPT-OSS-120B": "monitor_qa_gpt-oss-120b_baseline_val_split_20260414_175620_32b2af202ff9.jsonl",
+    "Qwen3-8B":     "monitor_qa_qwen3-8b_baseline_val_split_20260414_175620_e8ca076915e8.jsonl",
+    "Qwen3-32B":    "monitor_qa_qwen3-32b_baseline_val_split_20260414_175620_2b53e2ef1d8c.jsonl",
 }
 BASELINE_FILES_FT = {
-    "GPT-OSS-20B":  "monitor_qa_gpt-oss-20b-ft60_baseline_formatted_val_split_20260413_215558_7c7fd5cbb411.jsonl",
-    "GPT-OSS-120B": "monitor_qa_gpt-oss-120b-ft60_baseline_formatted_val_split_20260413_215558_63b4d9ae2327.jsonl",
-    "Qwen3-8B":     "monitor_qa_qwen3-8b-ft60_baseline_formatted_val_split_20260413_215558_6c8ab8a3dd85.jsonl",
-    "Qwen3-32B":    "monitor_qa_qwen3-32b-ft60_baseline_formatted_val_split_20260413_215558_36b96ca2e596.jsonl",
+    "GPT-OSS-20B":  "monitor_qa_gpt-oss-20b-ft60_baseline_val_split_20260414_175620_54474d2fd0aa.jsonl",
+    "GPT-OSS-120B": "monitor_qa_gpt-oss-120b-ft60_baseline_val_split_20260414_175620_b2cfeba9028f.jsonl",
+    "Qwen3-8B":     "monitor_qa_qwen3-8b-ft60_baseline_val_split_20260414_175620_267649d38784.jsonl",
+    "Qwen3-32B":    "monitor_qa_qwen3-32b-ft60_baseline_val_split_20260414_175620_a3a34aac77d6.jsonl",
 }
 
 MONITOR_GPT54 = "metr_note_gpt54"

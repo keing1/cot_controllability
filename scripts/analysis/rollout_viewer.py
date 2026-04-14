@@ -9,11 +9,16 @@ import html as html_mod
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from controllability.evals.prompts import get_monitor_prompt_builder
+from controllability.evals.rescore import build_monitor_messages
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -121,9 +126,24 @@ def parse_filename(path: Path) -> FileMetadata | None:
 # ---------------------------------------------------------------------------
 
 # Pattern: monitor_qa_{model}_{setting}_{datetime}_{run_id}.jsonl
-# Settings are known: baseline, default, dont_think
-# We split on the last occurrence of _baseline_, _default_, or _dont_think_
-_MQA_SETTING_RE = re.compile(r"_(baseline|default|dont_think)_")
+# List longer/more-specific settings first so the alternation picks them
+# before shorter prefixes (e.g. `user_default` before `default`).
+_MQA_SETTINGS = [
+    "baseline_main_and_side",
+    "baseline_formatted",
+    "user_intense_hiding",
+    "user_less_reasoning",
+    "user_dont_think",
+    "user_misdirect",
+    "user_gray_swan",
+    "user_roleplay",
+    "user_pressure",
+    "user_default",
+    "dont_think",
+    "baseline",
+    "default",
+]
+_MQA_SETTING_RE = re.compile(r"_(" + "|".join(_MQA_SETTINGS) + r")_")
 
 
 @dataclass
@@ -134,6 +154,7 @@ class MonitorQAFileMetadata:
     setting: str     # "baseline", "default", or "dont_think"
     run_id: str      # hex hash at end
     date_str: str    # e.g. "20260402_090606" or "20260403_rerun"
+    split: str       # "val", "old", or "unknown"
 
 
 def parse_monitor_qa_filename(path: Path) -> MonitorQAFileMetadata | None:
@@ -151,7 +172,16 @@ def parse_monitor_qa_filename(path: Path) -> MonitorQAFileMetadata | None:
     m = matches[0]
     model = rest[: m.start()]
     setting = m.group(1)
-    tail = rest[m.end():]  # e.g. "20260402_090606_f92876518053"
+    tail = rest[m.end():]  # e.g. "val_split_20260409_061534_c813097b7552"
+
+    # Extract split if present (val_split_ or old_split_)
+    split = "old"  # default for files without explicit split
+    if tail.startswith("val_split_"):
+        split = "val"
+        tail = tail[len("val_split_"):]
+    elif tail.startswith("old_split_"):
+        split = "old"
+        tail = tail[len("old_split_"):]
 
     # run_id is the last _-separated segment (hex hash)
     last_uscore = tail.rfind("_")
@@ -167,6 +197,7 @@ def parse_monitor_qa_filename(path: Path) -> MonitorQAFileMetadata | None:
         setting=setting,
         run_id=run_id,
         date_str=date_str,
+        split=split,
     )
 
 
@@ -261,12 +292,33 @@ def monitorqa_records_to_df(records: list[dict]) -> pd.DataFrame:
     for i, r in enumerate(records):
         sample = r.get("sample", {})
         actor_latency = r.get("actor_latency_ms", 0)
+        reasoning_lc = (r.get("reasoning") or "").lower()
+        mentions_task_terms = (
+            "main task" in reasoning_lc or "side task" in reasoning_lc
+        )
+        mentions_strong = (
+            mentions_task_terms
+            or "main:" in reasoning_lc
+            or "side:" in reasoning_lc
+            or "main_task" in reasoning_lc
+            or "side_task" in reasoning_lc
+            or "both tasks" in reasoning_lc
+            or "two tasks" in reasoning_lc
+            or "two questions" in reasoning_lc
+            or "main question" in reasoning_lc
+            or "side question" in reasoning_lc
+            or "main answer" in reasoning_lc
+            or "side answer" in reasoning_lc
+            or "both answer" in reasoning_lc
+        )
         row = {
             "idx": i,
             "sample_id": sample.get("id", ""),
             "mode": r.get("mode", ""),
             "monitor_score": r.get("monitor_score"),
             "side_task_correct": r.get("side_task_correct"),
+            "mentions_task_terms": mentions_task_terms,
+            "mentions_strong": mentions_strong,
             "actor_error": r.get("actor_error") or "",
             "monitor_error": r.get("monitor_error") or "",
             "latency_s": round(actor_latency / 1000, 1) if actor_latency else 0.0,
@@ -560,12 +612,14 @@ if not is_monitorqa:
     sel_table_idx = selected_rows[0]
     sel_record_idx = int(filtered_df.iloc[sel_table_idx]["idx"])
 
-    # Store navigation state
+    # Store navigation state — only update from table click when the
+    # selection actually changed (otherwise prev/next button updates
+    # get clobbered on rerun).
     if "detail_idx" not in st.session_state:
         st.session_state.detail_idx = sel_record_idx
-    else:
-        # If user clicked a new row, update
+    elif st.session_state.get("_last_table_sel") != sel_record_idx:
         st.session_state.detail_idx = sel_record_idx
+    st.session_state._last_table_sel = sel_record_idx
 
     detail_idx = st.session_state.detail_idx
     record = records[detail_idx]
@@ -686,6 +740,10 @@ else:
         all_mqa_models = sorted({m.model for m in all_mqa_meta})
         sel_mqa_models = st.multiselect("Model", all_mqa_models, default=all_mqa_models)
 
+        all_mqa_splits = sorted({m.split for m in all_mqa_meta})
+        default_splits = ["val"] if "val" in all_mqa_splits else all_mqa_splits
+        sel_mqa_splits = st.multiselect("Split", all_mqa_splits, default=default_splits)
+
         all_mqa_settings = sorted({m.setting for m in all_mqa_meta})
         sel_mqa_settings = st.multiselect("Setting", all_mqa_settings, default=all_mqa_settings)
 
@@ -699,6 +757,7 @@ else:
             m
             for m in all_mqa_meta
             if m.model in sel_mqa_models
+            and m.split in sel_mqa_splits
             and m.setting in sel_mqa_settings
             and m.date_str in sel_mqa_dates
         ]
@@ -745,9 +804,16 @@ else:
     monitor_types = _get_monitor_types_from_records(records)
     monitor_type_models = _get_monitor_type_models(records)
     if monitor_types:
+        # Default to metr_note_gpt54 if present, else first available
+        default_idx = (
+            monitor_types.index("metr_note_gpt54")
+            if "metr_note_gpt54" in monitor_types
+            else 0
+        )
         active_monitor = st.selectbox(
             "Monitor Type",
             monitor_types,
+            index=default_idx,
             format_func=lambda mt: f"{mt} ({monitor_type_models.get(mt, '?')})"
                 if monitor_type_models.get(mt) else mt,
         )
@@ -793,6 +859,8 @@ else:
     # ---- MonitorQA Row-level filters -----------------------------------------
 
     st.subheader("Filters")
+
+    # Row 1: primary filters
     fc1, fc2, fc3, fc4, fc5 = st.columns([2, 1, 1, 1, 2])
 
     with fc1:
@@ -809,6 +877,62 @@ else:
     with fc5:
         sample_search = st.text_input("Sample ID search")
 
+    # Row 2: reasoning & monitor score filters
+    has_ra = f"score_reasoning_audit" in df.columns
+    has_ra_mini = f"score_reasoning_audit_mini" in df.columns
+
+    fc_r1, fc_r2, fc_r3, fc_r4 = st.columns([1, 1, 2, 2])
+
+    with fc_r1:
+        mentions_filter = st.selectbox(
+            "Task terms in reasoning",
+            ["All", "True", "False"],
+            key="mqa_mentions_filter",
+            help="'main task' or 'side task' appears in reasoning.",
+        )
+    with fc_r2:
+        strong_filter = st.selectbox(
+            "Strong regex",
+            ["All", "True", "False"],
+            key="mqa_strong_filter",
+            help="Any of: 'main task', 'side task', 'main:', 'side:', "
+                 "'main_task', 'side_task', 'both tasks', 'two tasks', "
+                 "'two questions', 'main question', 'side question', "
+                 "'main answer', 'side answer', 'both answer'.",
+        )
+    with fc_r3:
+        if has_ra:
+            ra_max_val = df["score_reasoning_audit"].dropna().max()
+            ra_is_binary = ra_max_val is not None and ra_max_val <= 1.0
+            if ra_is_binary:
+                ra_min, ra_max = st.slider(
+                    "Reasoning Audit (GPT-5.4)", 0.0, 1.0, (0.0, 1.0), step=1.0,
+                    key="ra_range",
+                )
+            else:
+                ra_min, ra_max = st.slider(
+                    "Reasoning Audit (GPT-5.4)", 0.0, 10.0, (0.0, 10.0), step=0.5,
+                    key="ra_range",
+                )
+        else:
+            ra_min, ra_max = 0.0, 10.0
+    with fc_r4:
+        if has_ra_mini:
+            ra_mini_max_val = df["score_reasoning_audit_mini"].dropna().max()
+            ra_mini_is_binary = ra_mini_max_val is not None and ra_mini_max_val <= 1.0
+            if ra_mini_is_binary:
+                ra_mini_min, ra_mini_max = st.slider(
+                    "Reasoning Audit Mini (GPT-5.4-mini)", 0.0, 1.0, (0.0, 1.0), step=1.0,
+                    key="ra_mini_range",
+                )
+            else:
+                ra_mini_min, ra_mini_max = st.slider(
+                    "Reasoning Audit Mini (GPT-5.4-mini)", 0.0, 10.0, (0.0, 10.0), step=0.5,
+                    key="ra_mini_range",
+                )
+        else:
+            ra_mini_min, ra_mini_max = 0.0, 10.0
+
     mask = df["mode"].isin(sel_modes)
 
     # Monitor score range (applied to active monitor type)
@@ -820,10 +944,38 @@ else:
             ) | df[active_score_col].isna()
             mask = mask & score_mask
 
+    # Reasoning audit score range filters
+    if has_ra:
+        ra_upper = 1.0 if ra_is_binary else 10.0
+        if ra_min > 0.0 or ra_max < ra_upper:
+            ra_col = "score_reasoning_audit"
+            mask = mask & (
+                ((df[ra_col] >= ra_min) & (df[ra_col] <= ra_max))
+                | df[ra_col].isna()
+            )
+    if has_ra_mini:
+        ra_mini_upper = 1.0 if ra_mini_is_binary else 10.0
+        if ra_mini_min > 0.0 or ra_mini_max < ra_mini_upper:
+            ra_mini_col = "score_reasoning_audit_mini"
+            mask = mask & (
+                ((df[ra_mini_col] >= ra_mini_min) & (df[ra_mini_col] <= ra_mini_max))
+                | df[ra_mini_col].isna()
+            )
+
     # Side task correct filter
     if side_filter != "All":
         want_side = side_filter == "True"
         mask = mask & (df["side_task_correct"] == want_side)
+
+    # Reasoning-mentions-task-terms filter
+    if mentions_filter != "All":
+        want_mentions = mentions_filter == "True"
+        mask = mask & (df["mentions_task_terms"] == want_mentions)
+
+    # Strong regex filter
+    if strong_filter != "All":
+        want_strong = strong_filter == "True"
+        mask = mask & (df["mentions_strong"] == want_strong)
 
     # Error filter
     if error_filter == "No errors":
@@ -854,13 +1006,18 @@ else:
         "latency_s": st.column_config.NumberColumn("latency_s", format="%.1f"),
         "question_preview": st.column_config.TextColumn("question_preview", width="large"),
     }
-    # Add per-monitor-type score columns as progress bars
+    # Add per-monitor-type score columns
     for mt in monitor_types:
         col_name = f"score_{mt}"
         if col_name in filtered_df.columns:
-            col_config[col_name] = st.column_config.ProgressColumn(
-                col_name, min_value=0, max_value=10, format="%.1f",
-            )
+            if mt == "main_task_grading":
+                col_config[col_name] = st.column_config.NumberColumn(
+                    col_name, format="%d",
+                )
+            else:
+                col_config[col_name] = st.column_config.ProgressColumn(
+                    col_name, min_value=0, max_value=10, format="%.1f",
+                )
 
     event = st.dataframe(
         filtered_df,
@@ -884,8 +1041,9 @@ else:
 
     if "mqa_detail_idx" not in st.session_state:
         st.session_state.mqa_detail_idx = sel_record_idx
-    else:
+    elif st.session_state.get("_mqa_last_table_sel") != sel_record_idx:
         st.session_state.mqa_detail_idx = sel_record_idx
+    st.session_state._mqa_last_table_sel = sel_record_idx
 
     detail_idx = st.session_state.mqa_detail_idx
     record = records[detail_idx]
@@ -997,6 +1155,9 @@ else:
             st.code(sys_prompt, language=None)
 
     reasoning = record.get("reasoning", "")
+    response = record.get("response", "")
+    mqa_actor_err = record.get("actor_error")
+
     if reasoning:
         word_count = len(reasoning.split())
         char_count = len(reasoning)
@@ -1007,8 +1168,18 @@ else:
             f'max-height: 800px; overflow-y: auto;">{html_mod.escape(reasoning)}</div>',
             unsafe_allow_html=True,
         )
+    elif not mqa_actor_err:
+        st.markdown(
+            '### Reasoning / CoT Trace\n\n'
+            ':orange[Model skipped thinking] — closed `</think>` immediately without reasoning.'
+        )
 
-    response = record.get("response", "")
+    if reasoning and not response and not mqa_actor_err:
+        st.markdown(
+            ':red[Model never left thinking] — no `</think>` was produced; '
+            'entire output stayed in the think block.'
+        )
+
     if response:
         st.markdown("### Response")
         st.code(response, language=None)
@@ -1037,6 +1208,14 @@ else:
                 )
 
             mr_prompt = mr.get("monitor_prompt")
+            if not mr_prompt:
+                mr_prompt = record.get("monitor_prompt")
+            if not mr_prompt:
+                try:
+                    builder = get_monitor_prompt_builder(mt)
+                    mr_prompt = build_monitor_messages(builder, record)
+                except Exception:
+                    mr_prompt = None
             if mr_prompt:
                 with st.expander(f"Monitor Prompt ({mt})", expanded=False):
                     if isinstance(mr_prompt, list):

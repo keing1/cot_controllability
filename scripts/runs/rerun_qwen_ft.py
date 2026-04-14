@@ -106,9 +106,7 @@ def run_single_eval(
         f"monitor_qa_{label}_{setting_label}"
         f"_{run_id}_{config.experiment_id}.jsonl"
     )
-    config.__class__.output_filename = property(
-        lambda self, fn=custom_filename: fn
-    )
+    config.output_filename_override = custom_filename
 
     key = f"{label}/{setting_label}"
 

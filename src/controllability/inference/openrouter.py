@@ -62,9 +62,13 @@ class OpenRouterClient:
         """Send a completion request to OpenRouter."""
         session = await self._get_session()
 
+        messages = list(request.messages)
+        if request.prefill:
+            messages.append({"role": "assistant", "content": request.prefill})
+
         payload: dict[str, Any] = {
             "model": request.model,
-            "messages": request.messages,
+            "messages": messages,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
         }
@@ -128,6 +132,11 @@ class OpenRouterClient:
                 "prompt_tokens": usage_data.get("prompt_tokens", 0),
                 "completion_tokens": usage_data.get("completion_tokens", 0),
             }
+
+            # OpenRouter does not include prefill in the response —
+            # prepend it so callers see the full output.
+            if request.prefill:
+                content = request.prefill + content
 
             return InferenceResponse(
                 content=content,

@@ -104,9 +104,7 @@ async def run_one_test(
         f"timeout_test_{model_cfg['label']}_{timeout_label}"
         f"_{config.experiment_id}.jsonl"
     )
-    config.__class__.output_filename = property(
-        lambda self, fn=custom_filename: fn
-    )
+    config.output_filename_override = custom_filename
 
     label = f"{model_cfg['label']}/{timeout_label}"
     print(f"\nSTART: {label}")

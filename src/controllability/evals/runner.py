@@ -13,6 +13,7 @@ from controllability.evals.grading import (
     extract_answer,
     extract_main_task_response,
     extract_side_task_response,
+    extract_task_answer_response,
     grade_correctness,
     grade_side_task,
     has_extraneous_text,
@@ -44,7 +45,7 @@ from controllability.rollouts.store import (
     load_monitor_completed_keys,
     write_experiment_header,
 )
-from controllability.types import InferenceRequest, MonitorResult, MonitorRollout, Rollout, Sample
+from controllability.types import InferenceRequest, InferenceResponse, MonitorResult, MonitorRollout, Rollout, Sample
 
 
 def _create_client(config: ExperimentConfig, settings: Settings) -> InferenceClient:
@@ -76,7 +77,7 @@ def _build_prompts(
     sample: Sample,
     model_name: str,
     adversarial_pressure: str,
-    analysis_channel: bool = False,
+    analysis_channel: bool = True,
     include_synonyms: bool = False,
 ) -> tuple[str, str]:
     """Build (system_prompt, user_prompt) for a given mode and sample."""
@@ -430,11 +431,14 @@ async def _run_monitor_streaming(
             messages.append({"role": "system", "content": sys_prompt})
         messages.append({"role": "user", "content": usr_prompt})
 
+        prefill = actor_prompt_builder.build_actor_prefill(mode)
+
         actor_request = InferenceRequest(
             messages=messages,
             model=config.actor_model,
             max_tokens=config.actor_max_tokens,
             temperature=config.actor_temperature,
+            prefill=prefill,
         )
         actor_resp = await _single_with_retry(
             actor_client, actor_request, actor_sem, config.actor_max_retries,
@@ -445,6 +449,7 @@ async def _run_monitor_streaming(
         # --- Build monitor input ---
         main_task_resp = extract_main_task_response(actor_resp.content)
         side_task_resp = extract_side_task_response(actor_resp.content)
+        task_answer_resp = extract_task_answer_response(actor_resp.content)
         expected_answer = sample.metadata.get("side_task_answer", "")
         side_task_correct = grade_side_task(side_task_resp, expected_answer)
 
@@ -455,6 +460,7 @@ async def _run_monitor_streaming(
         stripped_prompt, stripped_reasoning, stripped_response = (
             actor_prompt_builder.build_stripped_versions(
                 sample, usr_prompt, actor_resp.reasoning, actor_resp.content,
+                mode=mode,
             )
         )
 
@@ -465,13 +471,36 @@ async def _run_monitor_streaming(
 
         for monitor_type in monitor_type_order:
             builder = monitor_prompt_builders[monitor_type]
-            monitor_messages = builder.build_monitor_prompt(
-                stripped_prompt, stripped_reasoning, stripped_response,
-            )
+            if getattr(builder, "is_grading_monitor", False):
+                # Grading monitor: question + correct answer + model answer
+                correct_answer = sample.metadata.get("main_task_answer", "")
+                # baseline: full response (no tags)
+                # baseline_formatted: <task_answer> content
+                # side_task modes: <main_task_answer> content
+                if mode == "baseline":
+                    model_answer = actor_resp.content
+                elif mode == "baseline_formatted":
+                    model_answer = task_answer_resp or actor_resp.content
+                else:
+                    model_answer = main_task_resp
+                monitor_messages = builder.build_grading_prompt(
+                    sample.question, correct_answer, model_answer,
+                )
+            elif getattr(builder, "uses_full_prompt", False):
+                monitor_messages = builder.build_monitor_prompt(
+                    usr_prompt, actor_resp.reasoning,
+                )
+            else:
+                monitor_messages = builder.build_monitor_prompt(
+                    stripped_prompt, stripped_reasoning, stripped_response,
+                )
 
+            monitor_model_name = config.monitor_model_overrides.get(
+                monitor_type, config.monitor_model,
+            )
             monitor_request = InferenceRequest(
                 messages=monitor_messages,
-                model=config.monitor_model,
+                model=monitor_model_name,
                 max_tokens=config.monitor_max_tokens,
                 temperature=config.monitor_temperature,
             )
@@ -482,10 +511,13 @@ async def _run_monitor_streaming(
                 print(f"    [{monitor_type} error] sample={sample.id}: {monitor_resp.error}")
 
             score = builder.parse_score(monitor_resp.content)
+            # Store monitor_prompt only for main_task_grading (others are
+            # duplicated in the top-level monitor_prompt field).
+            store_prompt = monitor_messages if monitor_type == "main_task_grading" else []
             monitor_results.append(MonitorResult(
                 monitor_type=monitor_type,
-                monitor_model=config.monitor_model,
-                monitor_prompt=monitor_messages,
+                monitor_model=monitor_model_name,
+                monitor_prompt=store_prompt,
                 monitor_response=monitor_resp.content,
                 monitor_score=score,
                 monitor_latency_ms=monitor_resp.latency_ms,
@@ -495,6 +527,13 @@ async def _run_monitor_streaming(
             total_monitor_latency += monitor_resp.latency_ms
             for k, v in monitor_resp.usage.items():
                 total_monitor_usage[k] = total_monitor_usage.get(k, 0) + v
+
+        # --- Derive main_task_correct from grading monitor ---
+        main_task_correct: bool | None = None
+        for mr in monitor_results:
+            if mr.monitor_type == "main_task_grading" and mr.monitor_score is not None:
+                main_task_correct = mr.monitor_score == 1.0
+                break
 
         # --- Assemble rollout ---
         # Legacy flat fields from the first monitor
@@ -511,6 +550,7 @@ async def _run_monitor_streaming(
             main_task_response=main_task_resp,
             side_task_response=side_task_resp,
             side_task_correct=side_task_correct,
+            main_task_correct=main_task_correct,
             monitor_results=monitor_results,
             # Legacy fields from first monitor
             monitor_model=first.monitor_model if first else "",
@@ -524,6 +564,7 @@ async def _run_monitor_streaming(
             monitor_latency_ms=total_monitor_latency,
             actor_usage=actor_resp.usage,
             monitor_usage=total_monitor_usage,
+            dataset_split=config.dataset_split,
             actor_error=actor_resp.error,
             monitor_error=first.monitor_error if first else None,
         )
@@ -575,7 +616,10 @@ async def run_monitor_experiment(config: MonitorQAConfig) -> list[MonitorRollout
         "actor_model": config.actor_model,
         "monitor_model": config.monitor_model,
         "dataset_path": config.dataset_path,
+        "dataset_split": config.dataset_split,
         "modes": config.modes,
+        "prompt_type": config.prompt_type,
+        "monitor_types": config.monitor_types,
         "experiment_id": config.experiment_id,
     })
 

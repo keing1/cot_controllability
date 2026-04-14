@@ -41,7 +41,7 @@ class ModelEvalSpec:
     seed: int = 42
     datasets: list[str] | None = None  # default: ["reasonif", "cotcontrol"]
     cotcontrol_n_samples: int = 100
-    analysis_channel: bool = False  # Use "analysis channel" terminology for ReasonIF
+    analysis_channel: bool = True  # Use "analysis channel" terminology for ReasonIF
 
 
 async def run_model_eval(spec: ModelEvalSpec) -> list[Path]:

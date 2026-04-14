@@ -138,7 +138,9 @@ class TinkerClient:
             messages = [{"role": m["role"], "content": m["content"]} for m in request.messages]
 
             # Render to token prompt
-            model_input = self._renderer.build_generation_prompt(messages)
+            model_input = self._renderer.build_generation_prompt(
+                messages, prefill=request.prefill,
+            )
 
             # Sample with our temperature
             response = await asyncio.wait_for(
@@ -208,6 +210,11 @@ class TinkerClient:
                         "", content, flags=re.DOTALL,
                     ).strip()
 
+
+            # Tinker does not include prefill in generated tokens — prepend
+            # it so callers see the full output (same as OpenRouter client).
+            if request.prefill:
+                content = request.prefill + content
 
             return InferenceResponse(
                 content=content,

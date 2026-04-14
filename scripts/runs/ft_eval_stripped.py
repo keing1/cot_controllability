@@ -422,9 +422,7 @@ def do_single_eval(spec: FTModelSpec, checkpoint_name: str, sampler_path: str,
     )
     output_path = Path(output_dir) / custom_filename
 
-    config.__class__.output_filename = property(
-        lambda self, fn=custom_filename: fn
-    )
+    config.output_filename_override = custom_filename
 
     logging.info("  Output: %s", output_path)
     asyncio.run(run_experiment(config))

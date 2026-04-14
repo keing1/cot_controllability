@@ -43,7 +43,7 @@ class ExperimentConfig(BaseSettings):
     model_path: str | None = None  # Tinker checkpoint path (tinker://...)
     reasoning_effort: str = "medium"  # Reasoning effort for gpt-oss models
     request_timeout: int = 300  # Per-request timeout in seconds (not in experiment_id)
-    analysis_channel: bool = False  # Use "analysis channel" instead of "reasoning" in ReasonIF prompts
+    analysis_channel: bool = True  # Use "analysis channel" instead of "reasoning" in ReasonIF prompts
     word_suppression_synonyms: bool = False  # Include synonyms in word_suppression prompt & grading (paper mode)
 
     @property
@@ -109,12 +109,14 @@ class MonitorQAConfig(BaseSettings):
 
     # Dataset
     dataset_path: str = "results/monitorqa/gpqa_hle_w_math_monitorqa.jsonl"
+    dataset_split: str = "val"  # "old", "val", or "test"
     n_samples: int | None = None
     seed: int = 42
 
     # Prompt types
     prompt_type: str = "default"
     monitor_types: list[str] = Field(default_factory=lambda: ["metr_note"])
+    monitor_model_overrides: dict[str, str] = Field(default_factory=dict)  # monitor_type -> model name
 
     # Modes
     modes: list[str] = Field(default_factory=lambda: ["side_task"])
@@ -127,6 +129,7 @@ class MonitorQAConfig(BaseSettings):
     # Output
     output_dir: str = "results/rollouts/monitor_qa"
     save_every: int = 100  # Save rollouts to disk every N samples
+    output_filename_override: str | None = None  # If set, use this filename instead of auto-generated
 
     @property
     def experiment_id(self) -> str:
@@ -136,6 +139,7 @@ class MonitorQAConfig(BaseSettings):
                 "actor_model": self.actor_model,
                 "monitor_model": self.monitor_model,
                 "dataset_path": self.dataset_path,
+                "dataset_split": self.dataset_split,
                 "modes": sorted(self.modes),
                 "n_samples": self.n_samples,
                 "seed": self.seed,
@@ -151,6 +155,8 @@ class MonitorQAConfig(BaseSettings):
     @property
     def output_filename(self) -> str:
         """Generate output filename with resume support."""
+        if self.output_filename_override:
+            return self.output_filename_override
         actor_short = self.actor_model.replace("/", "_")
         prefix = f"monitor_qa_{actor_short}_{self.experiment_id}"
         pattern = f"{self.output_dir}/{prefix}_*.jsonl"

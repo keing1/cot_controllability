@@ -98,9 +98,7 @@ def run_single_eval(model_cfg: dict, effort: str, dataset: str, run_id: str) -> 
         f"_{run_id}_{config.experiment_id}.jsonl"
     )
 
-    config.__class__.output_filename = property(
-        lambda self, fn=custom_filename: fn
-    )
+    config.output_filename_override = custom_filename
 
     key = f"{model_cfg['short']}_{dataset}_{effort}"
     logging.info("START: %s -> %s", key, custom_filename)

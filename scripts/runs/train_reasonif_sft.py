@@ -250,7 +250,7 @@ def do_eval():
             output_path = Path(EVAL_OUTPUT_DIR) / custom_filename
 
             # Monkey-patch the config to use our custom filename
-            config.__class__.output_filename = property(lambda self, fn=custom_filename: fn)
+            config.output_filename_override = custom_filename
 
             print(f"  Output: {output_path}")
             asyncio.run(run_experiment(config))

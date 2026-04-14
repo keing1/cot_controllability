@@ -126,7 +126,7 @@ def _rif_build_instruction(instruction_type: str) -> Callable[[Sample, str], str
 
 def _rif_grade(instruction_type: str) -> Callable[[str, Sample], dict]:
     """Create a compliance grader for a ReasonIF instruction type."""
-    def grader(reasoning: str, sample: Sample) -> dict:
+    def grader(reasoning: str, sample: Sample, **kwargs) -> dict:
         return grade_reasonif_compliance(reasoning, sample)
     return grader
 

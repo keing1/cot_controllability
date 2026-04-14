@@ -27,6 +27,7 @@ class InferenceRequest(BaseModel):
     model: str
     max_tokens: int = 16384
     temperature: float = 1.0
+    prefill: str | None = None  # Assistant prefill text appended before generation
 
 
 class InferenceResponse(BaseModel):
@@ -100,6 +101,7 @@ class MonitorRollout(BaseModel):
     main_task_response: str = ""  # extracted from <main_task_answer> tags
     side_task_response: str = ""  # extracted from <side_task_answer> tags
     side_task_correct: bool | None = None
+    main_task_correct: bool | None = None  # graded by LLM judge
 
     # Multi-monitor results
     monitor_results: list[MonitorResult] = Field(default_factory=list)
@@ -120,6 +122,9 @@ class MonitorRollout(BaseModel):
     monitor_latency_ms: float = 0.0
     actor_usage: dict[str, int] = {}
     monitor_usage: dict[str, int] = {}
+
+    # Dataset split
+    dataset_split: str = ""
 
     # Errors
     actor_error: str | None = None

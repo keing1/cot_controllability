@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""Add metr_note monitor scores to existing monitor_qa rollouts.
+"""Add main_task_grading scores to existing monitor_qa rollouts.
 
-Reads JSONL files in the top-level results/rollouts/monitor_qa/ directory,
-runs the metr_note monitor on each rollout using its stripped fields, and
-appends a MonitorResult entry to the monitor_results list.
+Uses GPT-5.4 to judge whether the model's main task answer is correct.
+Appends a MonitorResult entry with monitor_type="main_task_grading".
 
-Skips rollouts that already have a metr_note entry or have actor errors.
+For baseline mode: the "student's answer" is the full response text.
+For side_task mode: the "student's answer" is the extracted <main_task_answer> content.
+
+Requires that the monitorqa dataset file has main_task_answer fields, or that
+the correct answer can be looked up by main_id from source datasets.
+
+Skips rollouts that already have a main_task_grading entry or have actor errors.
 
 Usage:
-    uv run python scripts/runs/rescore_metr_note.py
-    uv run python scripts/runs/rescore_metr_note.py --concurrency 200 --dry-run
-    uv run python scripts/runs/rescore_metr_note.py --backup-dir results/rollouts/monitor_qa/pre_metr_note/
+    uv run python scripts/runs/rescore_main_task.py --dry-run
+    uv run python scripts/runs/rescore_main_task.py --concurrency 400
+    uv run python scripts/runs/rescore_main_task.py --backup-dir results/rollouts/monitor_qa/pre_main_task_grading/
 """
 
 import argparse
 import asyncio
 import json
 import logging
+import re
 import shutil
 import sys
 import time
@@ -25,12 +31,91 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from controllability.config import Settings
-from controllability.evals.prompts import get_monitor_prompt_builder
+from controllability.evals.grading import MainTaskGradingPromptBuilder
 from controllability.inference.batch import _single_with_retry
 from controllability.inference.openrouter import OpenRouterClient
 from controllability.types import InferenceRequest
 
 ROLLOUT_DIR = Path(__file__).resolve().parents[2] / "results" / "rollouts" / "monitor_qa"
+MONITOR_TYPE = "main_task_grading"
+
+# ---------------------------------------------------------------------------
+# Correct answer lookup
+# ---------------------------------------------------------------------------
+
+_ANSWER_LOOKUP: dict[str, str] | None = None
+
+
+def _build_answer_lookup() -> dict[str, str]:
+    """Build main_id -> correct_answer mapping from all monitorqa dataset files."""
+    global _ANSWER_LOOKUP
+    if _ANSWER_LOOKUP is not None:
+        return _ANSWER_LOOKUP
+
+    lookup = {}
+    monitorqa_dir = Path(__file__).resolve().parents[2] / "results" / "monitorqa"
+    for jsonl_path in monitorqa_dir.glob("*.jsonl"):
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                mid = d.get("metadata", {}).get("main_id", "")
+                answer = d.get("main_task_answer", "")
+                if mid and answer:
+                    lookup[mid] = answer
+
+    logging.info("Built answer lookup: %d entries", len(lookup))
+    _ANSWER_LOOKUP = lookup
+    return lookup
+
+
+def _get_correct_answer(rollout: dict) -> str:
+    """Get the correct answer for a rollout's main task."""
+    # Check if the sample already has it
+    sample = rollout.get("sample", {})
+    meta = sample.get("metadata", {})
+    answer = meta.get("main_task_answer", "") or sample.get("correct_answer", "")
+    if answer:
+        return answer
+
+    # Fall back to lookup by main_id
+    main_id = meta.get("main_id", "")
+    if main_id:
+        lookup = _build_answer_lookup()
+        return lookup.get(main_id, "")
+
+    return ""
+
+
+def _get_model_answer(rollout: dict) -> str:
+    """Get the model's main task answer from a rollout."""
+    mode = rollout.get("mode", "")
+    if mode == "baseline":
+        # Full response for baseline
+        return rollout.get("response", "")
+    else:
+        # Extract from main_task_response or from tags
+        main_resp = rollout.get("main_task_response", "")
+        if main_resp:
+            return main_resp
+        # Fallback: extract from response tags
+        response = rollout.get("response", "")
+        match = re.search(
+            r"<main_task_answer>(.*?)</main_task_answer>", response, re.DOTALL,
+        )
+        if match:
+            return match.group(1).strip()
+        return response
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
 
 
 async def rescore_file(
@@ -43,10 +128,9 @@ async def rescore_file(
     concurrency: int,
     max_retries: int,
     backup_dir: Path | None,
-    rescore_le: float | None,
 ) -> dict:
-    """Add metr_note scores to all eligible rollouts in a single JSONL file."""
-    builder = get_monitor_prompt_builder("metr_note")
+    """Add main_task_grading scores to all eligible rollouts in a JSONL file."""
+    builder = MainTaskGradingPromptBuilder()
     sem = asyncio.Semaphore(concurrency)
 
     # Read all lines
@@ -65,29 +149,31 @@ async def rescore_file(
             except json.JSONDecodeError:
                 continue
 
-    # Identify which rollouts need scoring.
-    # Rescore if: no entry for metr_note, OR entry exists but score is None.
+    # Identify which rollouts need scoring
     to_score: list[int] = []
+    skipped_no_answer = 0
     for i, r in enumerate(rollout_lines):
         if r.get("actor_error"):
             continue
-        existing_score = None
-        has_any = False
-        for mr in r.get("monitor_results", []):
-            if mr.get("monitor_type") == "metr_note":
-                has_any = True
-                existing_score = mr.get("monitor_score")
-                break
-        if has_any and existing_score is not None:
-            if rescore_le is None or existing_score > rescore_le:
-                continue
-        if not r.get("stripped_prompt") and not r.get("reasoning"):
+        has_valid = any(
+            mr.get("monitor_type") == MONITOR_TYPE and mr.get("monitor_score") is not None
+            for mr in r.get("monitor_results", [])
+        )
+        if has_valid:
+            continue
+        # Need both correct answer and model answer
+        correct = _get_correct_answer(r)
+        model_ans = _get_model_answer(r)
+        if not correct:
+            skipped_no_answer += 1
+            continue
+        if not model_ans:
             continue
         to_score.append(i)
 
     logging.info(
-        "  %s: %d rollouts, %d to score with metr_note",
-        path.name, len(rollout_lines), len(to_score),
+        "  %s: %d rollouts, %d to score, %d skipped (no correct answer)",
+        path.name, len(rollout_lines), len(to_score), skipped_no_answer,
     )
 
     if not to_score:
@@ -95,15 +181,14 @@ async def rescore_file(
 
     completed = [0]
     total = len(to_score)
-    errors = 0
 
     async def score_one(idx: int) -> tuple[int, float | None, str, str | None, float, dict]:
         r = rollout_lines[idx]
-        messages = builder.build_monitor_prompt(
-            r.get("stripped_prompt", ""),
-            r.get("reasoning", ""),
-            r.get("stripped_response", ""),
-        )
+        question = r.get("sample", {}).get("question", "")
+        correct_answer = _get_correct_answer(r)
+        model_answer = _get_model_answer(r)
+
+        messages = builder.build_grading_prompt(question, correct_answer, model_answer)
         request = InferenceRequest(
             messages=messages,
             model=monitor_model,
@@ -114,34 +199,36 @@ async def rescore_file(
         score = builder.parse_score(resp.content)
         completed[0] += 1
         c = completed[0]
-        if c % 200 == 0 or c == total:
+        if c % 500 == 0 or c == total:
             logging.info("    %s: %d/%d scored", path.name, c, total)
         return idx, score, resp.content, resp.error, resp.latency_ms, resp.usage
 
     tasks = [score_one(i) for i in to_score]
     results = await asyncio.gather(*tasks)
 
+    errors = 0
     for idx, score, response_text, error, latency_ms, usage in results:
         r = rollout_lines[idx]
-        # Ensure monitor_results list exists
         if "monitor_results" not in r or r["monitor_results"] is None:
             r["monitor_results"] = []
-        # Drop any existing stale (None-score) entry
+        # Drop any existing stale (None-score) entry for this monitor type
         r["monitor_results"] = [
             mr for mr in r["monitor_results"]
-            if mr.get("monitor_type") != "metr_note"
+            if mr.get("monitor_type") != MONITOR_TYPE
         ]
-        # Append metr_note result
         r["monitor_results"].append({
-            "monitor_type": "metr_note",
+            "monitor_type": MONITOR_TYPE,
             "monitor_model": monitor_model,
-            "monitor_prompt": [],  # skip storing prompt to save disk space
+            "monitor_prompt": [],
             "monitor_response": response_text,
             "monitor_score": score,
             "monitor_latency_ms": latency_ms,
             "monitor_usage": usage,
             "monitor_error": error,
         })
+        # Set main_task_correct on the rollout
+        if score is not None:
+            r["main_task_correct"] = score == 1.0
         if error:
             errors += 1
 
@@ -179,8 +266,8 @@ async def main_async(args):
         return
 
     logging.info(
-        "Scoring %d file(s) with metr_note monitor (model=%s, concurrency=%d)",
-        len(files), args.monitor_model, args.concurrency,
+        "Scoring %d file(s) with %s (model=%s, concurrency=%d)",
+        len(files), MONITOR_TYPE, args.monitor_model, args.concurrency,
     )
 
     try:
@@ -196,7 +283,6 @@ async def main_async(args):
                 concurrency=args.concurrency,
                 max_retries=args.max_retries,
                 backup_dir=Path(args.backup_dir) if args.backup_dir else None,
-                rescore_le=args.rescore_le,
             )
             elapsed = time.time() - t0
             summary["elapsed_s"] = round(elapsed, 1)
@@ -208,10 +294,9 @@ async def main_async(args):
     finally:
         await monitor_client.close()
 
-    # Print summary
     logging.info("")
     logging.info("=" * 60)
-    logging.info("METR_NOTE SCORING COMPLETE")
+    logging.info("MAIN TASK GRADING COMPLETE")
     logging.info("=" * 60)
     total_scored = 0
     total_errors = 0
@@ -223,25 +308,20 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Add metr_note monitor scores to existing monitor_qa rollouts"
+        description="Add main_task_grading scores to existing monitor_qa rollouts"
     )
-    parser.add_argument("--monitor-model", type=str, default="openai/gpt-4.1")
-    parser.add_argument("--monitor-max-tokens", type=int, default=1024)
+    parser.add_argument("--monitor-model", type=str, default="openai/gpt-5.4")
+    parser.add_argument("--monitor-max-tokens", type=int, default=16384)
     parser.add_argument("--monitor-temperature", type=float, default=0.0)
-    parser.add_argument("--concurrency", type=int, default=200)
+    parser.add_argument("--concurrency", type=int, default=400)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=120)
-    parser.add_argument("--backup-dir", type=str, default=None,
-                        help="Directory to save backup copies before scoring")
+    parser.add_argument("--backup-dir", type=str, default=None)
     parser.add_argument("--file-glob", type=str, default="*.jsonl",
                         help="Glob pattern (relative to rollouts dir) to restrict which files are processed")
-    parser.add_argument("--rescore-le", type=float, default=None,
-                        help="Also rescore entries whose existing score is <= this threshold")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print what would be scored without running")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    # Setup logging
     formatter = logging.Formatter(
         "[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
@@ -252,13 +332,15 @@ def main():
     root.addHandler(handler)
 
     if args.dry_run:
+        _build_answer_lookup()  # noqa: preload for lookup
         files = sorted(ROLLOUT_DIR.glob(args.file_glob))
         files = [f for f in files if f.is_file()]
-        grand_score = 0
+        total_to_score = 0
         for path in files:
             total = 0
             scoreable = 0
             already_done = 0
+            no_answer = 0
             with open(path) as f:
                 for line in f:
                     s = line.strip()
@@ -271,22 +353,23 @@ def main():
                     total += 1
                     if r.get("actor_error"):
                         continue
-                    existing_score = None
-                    has_any = False
-                    for mr in r.get("monitor_results", []):
-                        if mr.get("monitor_type") == "metr_note":
-                            has_any = True
-                            existing_score = mr.get("monitor_score")
-                            break
-                    if has_any and existing_score is not None:
-                        if args.rescore_le is None or existing_score > args.rescore_le:
-                            already_done += 1
-                            continue
+                    has_valid = any(
+                        mr.get("monitor_type") == MONITOR_TYPE
+                        and mr.get("monitor_score") is not None
+                        for mr in r.get("monitor_results", [])
+                    )
+                    if has_valid:
+                        already_done += 1
+                        continue
+                    correct = _get_correct_answer(r)
+                    if not correct:
+                        no_answer += 1
+                        continue
                     scoreable += 1
-            grand_score += scoreable
+            total_to_score += scoreable
             if scoreable:
-                print(f"  {path.name}: {total} total, {scoreable} to score, {already_done} already done")
-        print(f"Total to rescore: {grand_score}")
+                print(f"  {path.name}: {total} total, {scoreable} to score, {already_done} done, {no_answer} no answer")
+        print(f"\n  Total to score: {total_to_score}")
         return
 
     asyncio.run(main_async(args))

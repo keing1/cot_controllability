@@ -203,10 +203,11 @@ def load_monitor_dataset(path: str | Path) -> list[Sample]:
                 id=str(sample_id),
                 dataset="monitor_qa",
                 question=entry["main_task"],
-                correct_answer="",
+                correct_answer=str(entry.get("main_task_answer", "")),
                 metadata={
                     "side_task": entry["side_task"],
                     "side_task_answer": str(entry.get("side_task_answer", "")),
+                    "main_task_answer": str(entry.get("main_task_answer", "")),
                     "source": entry.get("source", ""),
                     **extra_meta,
                 },

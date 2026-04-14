@@ -66,9 +66,7 @@ def run_eval(model: str, effort: str, run_id: str) -> None:
         f"_{run_id}_{config.experiment_id}.jsonl"
     )
 
-    config.__class__.output_filename = property(
-        lambda self, fn=custom_filename: fn
-    )
+    config.output_filename_override = custom_filename
 
     output_path = ROLLOUTS_DIR / custom_filename
     logging.info("Eval: %s effort=%s -> %s", model, effort, output_path.name)

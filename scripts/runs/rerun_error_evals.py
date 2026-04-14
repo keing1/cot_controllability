@@ -247,9 +247,7 @@ def run_eval_for_file(rf: RolloutFile, request_timeout: int) -> None:
 
     # Override output_filename to point to existing file
     custom_filename = rf.path.name
-    config.__class__.output_filename = property(
-        lambda self, fn=custom_filename: fn
-    )
+    config.output_filename_override = custom_filename
 
     logging.info("  Output: %s", rf.path)
     asyncio.run(run_experiment(config))

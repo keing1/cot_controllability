@@ -405,7 +405,7 @@ def do_eval_checkpoints(spec: FTModelSpec) -> None:
             output_path = Path(output_dir) / custom_filename
 
             # Monkey-patch the config to use our custom filename
-            config.__class__.output_filename = property(lambda self, fn=custom_filename: fn)
+            config.output_filename_override = custom_filename
 
             logging.info("  Output: %s", output_path)
             asyncio.run(run_experiment(config))
@@ -464,7 +464,7 @@ def do_effort_sweep() -> None:
                 )
                 output_path = Path(output_dir) / custom_filename
 
-                config.__class__.output_filename = property(lambda self, fn=custom_filename: fn)
+                config.output_filename_override = custom_filename
 
                 logging.info("  %s effort=%s -> %s", dataset, effort, output_path)
                 asyncio.run(run_experiment(config))

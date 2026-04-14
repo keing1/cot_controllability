@@ -42,6 +42,7 @@ async def rescore_file(
     concurrency: int,
     max_retries: int,
     backup_dir: Path | None,
+    rescore_le: float | None,
 ) -> dict:
     """Add metr_note_gpt54 scores to all eligible rollouts in a single JSONL file."""
     builder = get_monitor_prompt_builder("metr_note")
@@ -63,18 +64,24 @@ async def rescore_file(
             except json.JSONDecodeError:
                 continue
 
-    # Identify which rollouts need scoring
+    # Identify which rollouts need scoring.
+    # Rescore if: no entry for MONITOR_TYPE, OR entry exists but score is None.
     to_score: list[int] = []
     for i, r in enumerate(rollout_lines):
         if r.get("actor_error"):
             continue
-        existing_types = {
-            mr.get("monitor_type")
-            for mr in r.get("monitor_results", [])
-        }
-        if MONITOR_TYPE in existing_types:
-            continue
-        if not r.get("stripped_prompt") and not r.get("stripped_reasoning"):
+        existing_score = None
+        has_any = False
+        for mr in r.get("monitor_results", []):
+            if mr.get("monitor_type") == MONITOR_TYPE:
+                has_any = True
+                existing_score = mr.get("monitor_score")
+                break
+        # Skip if already has a valid score AND it's above the rescore threshold
+        if has_any and existing_score is not None:
+            if rescore_le is None or existing_score > rescore_le:
+                continue
+        if not r.get("stripped_prompt") and not r.get("reasoning"):
             continue
         to_score.append(i)
 
@@ -94,7 +101,7 @@ async def rescore_file(
         r = rollout_lines[idx]
         messages = builder.build_monitor_prompt(
             r.get("stripped_prompt", ""),
-            r.get("stripped_reasoning", ""),
+            r.get("reasoning", ""),
             r.get("stripped_response", ""),
         )
         request = InferenceRequest(
@@ -118,6 +125,11 @@ async def rescore_file(
         r = rollout_lines[idx]
         if "monitor_results" not in r or r["monitor_results"] is None:
             r["monitor_results"] = []
+        # Drop any existing stale (None-score) entry for this monitor type
+        r["monitor_results"] = [
+            mr for mr in r["monitor_results"]
+            if mr.get("monitor_type") != MONITOR_TYPE
+        ]
         r["monitor_results"].append({
             "monitor_type": MONITOR_TYPE,
             "monitor_model": monitor_model,
@@ -158,9 +170,10 @@ async def main_async(args):
         request_timeout=args.timeout,
     )
 
-    files = sorted(f for f in ROLLOUT_DIR.iterdir() if f.suffix == ".jsonl" and f.is_file())
+    files = sorted(ROLLOUT_DIR.glob(args.file_glob))
+    files = [f for f in files if f.is_file()]
     if not files:
-        logging.error("No .jsonl files found in %s", ROLLOUT_DIR)
+        logging.error("No files match %s in %s", args.file_glob, ROLLOUT_DIR)
         return
 
     logging.info(
@@ -181,6 +194,7 @@ async def main_async(args):
                 concurrency=args.concurrency,
                 max_retries=args.max_retries,
                 backup_dir=Path(args.backup_dir) if args.backup_dir else None,
+                rescore_le=args.rescore_le,
             )
             elapsed = time.time() - t0
             summary["elapsed_s"] = round(elapsed, 1)
@@ -216,6 +230,10 @@ def main():
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--backup-dir", type=str, default=None,
                         help="Directory to save backup copies before scoring")
+    parser.add_argument("--file-glob", type=str, default="*.jsonl",
+                        help="Glob pattern (relative to rollouts dir) to restrict which files are processed")
+    parser.add_argument("--rescore-le", type=float, default=None,
+                        help="Also rescore entries whose existing score is <= this threshold")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be scored without running")
     args = parser.parse_args()
@@ -230,7 +248,9 @@ def main():
     root.addHandler(handler)
 
     if args.dry_run:
-        files = sorted(f for f in ROLLOUT_DIR.iterdir() if f.suffix == ".jsonl" and f.is_file())
+        files = sorted(ROLLOUT_DIR.glob(args.file_glob))
+        files = [f for f in files if f.is_file()]
+        grand_score = 0
         for path in files:
             total = 0
             scoreable = 0
@@ -247,15 +267,22 @@ def main():
                     total += 1
                     if r.get("actor_error"):
                         continue
-                    existing_types = {
-                        mr.get("monitor_type")
-                        for mr in r.get("monitor_results", [])
-                    }
-                    if MONITOR_TYPE in existing_types:
-                        already_done += 1
-                        continue
+                    existing_score = None
+                    has_any = False
+                    for mr in r.get("monitor_results", []):
+                        if mr.get("monitor_type") == MONITOR_TYPE:
+                            has_any = True
+                            existing_score = mr.get("monitor_score")
+                            break
+                    if has_any and existing_score is not None:
+                        if args.rescore_le is None or existing_score > args.rescore_le:
+                            already_done += 1
+                            continue
                     scoreable += 1
-            print(f"  {path.name}: {total} total, {scoreable} to score, {already_done} already done")
+            grand_score += scoreable
+            if scoreable:
+                print(f"  {path.name}: {total} total, {scoreable} to score, {already_done} already done")
+        print(f"Total to rescore: {grand_score}")
         return
 
     asyncio.run(main_async(args))

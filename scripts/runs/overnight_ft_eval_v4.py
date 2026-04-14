@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Overnight FT + Eval v2: train 4 models at two learning rates, eval checkpoints.
+"""Overnight FT + Eval v4: LoRA rank 1, 240 examples, lr=1e-4.
 
-Runs 8 total fine-tunes (4 models x 2 LRs):
-  - lr=4e-4  ("high LR")
-  - lr=2.5e-5 ("low LR")
+Fine-tunes gpt-oss-20b, gpt-oss-120b, qwen3-8b, qwen3-32b on the first
+240 examples of existing SFT data with LoRA rank 1 and lr=1e-4.
 
-Then evaluates every checkpoint on both eval suites (reasonif + cotcontrol).
+Queueing:
+  Phase 1: 4 fine-tunes in parallel (all at once).
+  Phase 2: As FTs finish, queue evals. Start evals once >=2 FTs done.
+           Max 3 concurrent eval jobs. CotControl evals first, then ReasonIF.
 
 Usage:
-    python scripts/runs/overnight_ft_eval_v2.py --dry-run
-    python scripts/runs/overnight_ft_eval_v2.py
-    python scripts/runs/overnight_ft_eval_v2.py --delay 3600   # wait 1hr before starting
-    python scripts/runs/overnight_ft_eval_v2.py --models gpt-oss-20b,qwen3-8b
-    python scripts/runs/overnight_ft_eval_v2.py --lrs 4e-4     # only high LR
-    python scripts/runs/overnight_ft_eval_v2.py --eval-only --run-id 20260320_XXXXXX
+    python scripts/runs/overnight_ft_eval_v4.py --dry-run
+    python scripts/runs/overnight_ft_eval_v4.py
+    python scripts/runs/overnight_ft_eval_v4.py --eval-only --run-id 20260407_XXXXXX
+
+    # Internal: run a single FT job
+    python scripts/runs/overnight_ft_eval_v4.py --single-ft <model_short_name> --run-id <id>
+
+    # Internal: run a single eval job
+    python scripts/runs/overnight_ft_eval_v4.py --single-eval <model_short_name> --dataset <ds> --run-id <id>
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import asyncio
 import json
 import logging
 import random
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -49,31 +55,30 @@ from controllability.evals.runner import run_experiment
 # Constants
 # --------------------------------------------------------------------------- #
 
-RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
+SCRIPT_PATH = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT_PATH.parents[2]
+RESULTS_DIR = PROJECT_ROOT / "results"
 SFT_DIR = RESULTS_DIR / "sft"
 ROLLOUTS_DIR = RESULTS_DIR / "rollouts"
-LOG_FILE = RESULTS_DIR / "overnight_ft_eval_v2.log"
+LOG_FILE = RESULTS_DIR / "overnight_ft_eval_v4.log"
 
 RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-# Shared training hyperparams (same as before, except LR which is parameterized)
+# Training hyperparams
 BATCH_SIZE = 4
 MAX_LENGTH = 8192
 NUM_EPOCHS = 1
-LORA_RANK = 32
+LORA_RANK = 1
+LEARNING_RATE = 1e-4
+LR_LABEL = "lr1e-4"
 SAVE_EVERY = 60
 EVAL_EVERY = 10
+N_TRAIN_EXAMPLES = 240
 
-# Learning rates to sweep
-LR_CONFIGS = [
-    {"lr": 4e-4, "label": "lr4e-4"},
-    {"lr": 2.5e-5, "label": "lr2.5e-5"},
-]
-
-# Eval config
+# Eval config — cotcontrol first, then reasonif
 EVAL_DATASETS = [
-    {"dataset": "reasonif", "modes": "all", "n_samples": None},
     {"dataset": "cotcontrol", "modes": "all", "n_samples": 100},
+    {"dataset": "reasonif", "modes": "all", "n_samples": None},
 ]
 
 DATASET_MODES = {
@@ -146,7 +151,7 @@ FT_MODELS = [
 
 
 # --------------------------------------------------------------------------- #
-# Qwen3 CoT Renderer (same as v1)
+# Qwen3 CoT Renderer
 # --------------------------------------------------------------------------- #
 
 class Qwen3CoTRenderer(Qwen3Renderer):
@@ -179,12 +184,15 @@ class Qwen3CoTRenderer(Qwen3Renderer):
 
 
 # --------------------------------------------------------------------------- #
-# Dataset (same as v1)
+# Dataset
 # --------------------------------------------------------------------------- #
 
 class ReasonIFDataset(SupervisedDataset):
-    def __init__(self, parquet_path, batch_size, max_length, renderer):
+    def __init__(self, parquet_path, batch_size, max_length, renderer,
+                 n_examples: int | None = None):
         df = pd.read_parquet(parquet_path)
+        if n_examples is not None:
+            df = df.iloc[:n_examples]
         self._conversations = []
         for _, row in df.iterrows():
             messages = []
@@ -242,10 +250,11 @@ class ReasonIFDatasetBuilder(SupervisedDatasetBuilder):
             batch_size=BATCH_SIZE,
             max_length=MAX_LENGTH,
             renderer=renderer,
+            n_examples=N_TRAIN_EXAMPLES,
         )
         logging.info(
-            "Dataset: %d examples, %d batches of %d",
-            len(dataset._conversations), len(dataset), BATCH_SIZE,
+            "Dataset: %d examples (of %d total), %d batches of %d",
+            len(dataset._conversations), N_TRAIN_EXAMPLES, len(dataset), BATCH_SIZE,
         )
         return dataset, None
 
@@ -290,38 +299,40 @@ def _load_checkpoints(log_path: Path) -> list[dict]:
     return [c for c in checkpoints if "sampler_path" in c]
 
 
-def _log_path_for(spec: FTModelSpec, lr_label: str, run_id: str) -> str:
-    """Build log path that includes LR label + run ID to avoid collisions."""
-    return str(SFT_DIR / f"{spec.log_path}-{lr_label}-{run_id}")
+def _log_path_for(spec: FTModelSpec, run_id: str) -> str:
+    return str(SFT_DIR / f"{spec.log_path}-lora1-{LR_LABEL}-{run_id}")
+
+
+def _get_spec_by_short_name(name: str) -> FTModelSpec:
+    for s in FT_MODELS:
+        if s.short_name == name:
+            return s
+    raise ValueError(f"Unknown model: {name}. Available: {[s.short_name for s in FT_MODELS]}")
 
 
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
 
-def do_train(spec: FTModelSpec, lr: float, lr_label: str, run_id: str) -> None:
+def do_train(spec: FTModelSpec, run_id: str) -> None:
     global _ACTIVE_SPEC
     _ACTIVE_SPEC = spec
 
-    log_path = _log_path_for(spec, lr_label, run_id)
+    log_path = _log_path_for(spec, run_id)
 
     logging.info("=" * 60)
-    logging.info("TRAINING: %s  lr=%s (%s)", spec.model, lr, lr_label)
+    logging.info("TRAINING: %s  lr=%s  lora_rank=%d  n_examples=%d",
+                 spec.model, LEARNING_RATE, LORA_RANK, N_TRAIN_EXAMPLES)
     logging.info("=" * 60)
     logging.info("Base model:  %s", spec.base_model)
     logging.info("Parquet:     %s", SFT_DIR / spec.parquet)
     logging.info("Log path:    %s", log_path)
-    logging.info("Renderer:    %s (effort=%s)", spec.renderer_type, spec.reasoning_effort)
-    logging.info(
-        "LR=%s  batch_size=%d  lora_rank=%d  save_every=%d",
-        lr, BATCH_SIZE, LORA_RANK, SAVE_EVERY,
-    )
 
     config = Config(
         log_path=log_path,
         model_name=spec.base_model,
         dataset_builder=ReasonIFDatasetBuilder(),
-        learning_rate=lr,
+        learning_rate=LEARNING_RATE,
         lr_schedule="linear",
         num_epochs=NUM_EPOCHS,
         lora_rank=LORA_RANK,
@@ -333,27 +344,30 @@ def do_train(spec: FTModelSpec, lr: float, lr_label: str, run_id: str) -> None:
     )
 
     asyncio.run(train_main(config))
-    logging.info("Training complete for %s lr=%s", spec.model, lr_label)
+    logging.info("Training complete for %s", spec.model)
 
 
 # --------------------------------------------------------------------------- #
-# Checkpoint Evaluation
+# Checkpoint Evaluation (single dataset)
 # --------------------------------------------------------------------------- #
 
-def do_eval_checkpoints(spec: FTModelSpec, lr_label: str, run_id: str) -> None:
-    log_path = Path(_log_path_for(spec, lr_label, run_id))
+def do_eval_checkpoints(spec: FTModelSpec, run_id: str,
+                         dataset_filter: str | None = None) -> None:
+    log_path = Path(_log_path_for(spec, run_id))
     checkpoints = _load_checkpoints(log_path)
 
     if not checkpoints:
-        logging.warning("No checkpoints to evaluate for %s lr=%s", spec.model, lr_label)
+        logging.warning("No checkpoints to evaluate for %s", spec.model)
         return
 
+    eval_datasets = EVAL_DATASETS
+    if dataset_filter:
+        eval_datasets = [e for e in EVAL_DATASETS if e["dataset"] == dataset_filter]
+
     logging.info("=" * 60)
-    logging.info("EVALUATING CHECKPOINTS: %s lr=%s (%d checkpoints)",
-                 spec.model, lr_label, len(checkpoints))
+    logging.info("EVALUATING: %s (%d checkpoints, %d datasets)",
+                 spec.model, len(checkpoints), len(eval_datasets))
     logging.info("=" * 60)
-    for c in checkpoints:
-        logging.info("  %s -> %s", c["name"], c["sampler_path"])
 
     output_dir = str(ROLLOUTS_DIR)
 
@@ -361,15 +375,17 @@ def do_eval_checkpoints(spec: FTModelSpec, lr_label: str, run_id: str) -> None:
         ckpt_name = ckpt["name"]
         sampler_path = ckpt["sampler_path"]
 
-        for eval_cfg in EVAL_DATASETS:
+        for eval_cfg in eval_datasets:
             dataset = eval_cfg["dataset"]
             modes = _resolve_modes(eval_cfg["modes"], dataset)
             n_samples = eval_cfg["n_samples"]
 
-            # Model label includes LR and checkpoint
-            model_label = f"{spec.model}-rif-{lr_label}-{ckpt_name}"
+            model_label = f"{spec.model}-rif-lora1-{LR_LABEL}-{ckpt_name}"
 
             logging.info("Eval: %s on %s", model_label, dataset)
+
+            # Use analysis_channel for gpt-oss on reasonif
+            use_ac = "gpt-oss" in spec.model and dataset == "reasonif"
 
             config = ExperimentConfig(
                 model=spec.model,
@@ -388,9 +404,9 @@ def do_eval_checkpoints(spec: FTModelSpec, lr_label: str, run_id: str) -> None:
                 model_path=sampler_path,
                 reasoning_effort=spec.reasoning_effort,
                 request_timeout=420,
+                analysis_channel=use_ac,
             )
 
-            # Custom filename with LR label + run ID to guarantee uniqueness
             model_short = model_label.replace("/", "_")
             dataset_short = dataset.replace("/", "_")
             custom_filename = (
@@ -399,66 +415,209 @@ def do_eval_checkpoints(spec: FTModelSpec, lr_label: str, run_id: str) -> None:
             )
             output_path = Path(output_dir) / custom_filename
 
-            # Monkey-patch the config to use custom filename
             config.output_filename_override = custom_filename
 
             logging.info("  Output: %s", output_path)
             asyncio.run(run_experiment(config))
 
-    logging.info("All checkpoint evals complete for %s lr=%s", spec.model, lr_label)
+    logging.info("Eval complete for %s on %s", spec.model,
+                 dataset_filter or "all datasets")
+
+
+# --------------------------------------------------------------------------- #
+# Single-job modes (called by pool manager via subprocess)
+# --------------------------------------------------------------------------- #
+
+def run_single_ft(spec: FTModelSpec, run_id: str) -> None:
+    log_file = RESULTS_DIR / f"ft_v4_{spec.short_name}_ft.log"
+    _setup_logging(log_file)
+    do_train(spec, run_id)
+
+
+def run_single_eval(spec: FTModelSpec, dataset: str, run_id: str) -> None:
+    log_file = RESULTS_DIR / f"ft_v4_{spec.short_name}_eval_{dataset}.log"
+    _setup_logging(log_file)
+    do_eval_checkpoints(spec, run_id, dataset_filter=dataset)
+
+
+# --------------------------------------------------------------------------- #
+# Pool Manager with phased queueing
+# --------------------------------------------------------------------------- #
+
+def _launch_subprocess(args: list[str], log_file: Path) -> subprocess.Popen:
+    """Launch a subprocess with stdout/stderr to log_file."""
+    with open(log_file, "w") as lf:
+        return subprocess.Popen(
+            args, stdout=lf, stderr=subprocess.STDOUT, cwd=str(PROJECT_ROOT),
+        )
+
+
+def run_pool(specs: list[FTModelSpec], run_id: str,
+             max_eval_workers: int = 3, eval_only: bool = False) -> dict[str, str]:
+    """Phased execution: 4 FTs in parallel, then evals with backfill."""
+
+    results: dict[str, str] = {}
+
+    # ---- Phase 1: Launch all 4 FTs in parallel ----
+    if not eval_only:
+        print(f"\n{'=' * 70}")
+        print(f"PHASE 1: Fine-tuning ({len(specs)} models in parallel)")
+        print(f"  LoRA rank={LORA_RANK}, lr={LEARNING_RATE}, n_examples={N_TRAIN_EXAMPLES}")
+        print(f"{'=' * 70}")
+
+        ft_procs: dict[str, tuple[subprocess.Popen, Path]] = {}
+        for spec in specs:
+            job_key = f"ft_{spec.short_name}"
+            log_file = RESULTS_DIR / f"ft_v4_{spec.short_name}_ft.log"
+            cmd = [
+                sys.executable, str(SCRIPT_PATH),
+                "--single-ft", spec.short_name,
+                "--run-id", run_id,
+            ]
+            print(f"  Launching: {spec.short_name} (log: {log_file})")
+            ft_procs[job_key] = (_launch_subprocess(cmd, log_file), log_file)
+
+        # Wait for FTs, collecting finished ones
+        ft_done: set[str] = set()
+        while len(ft_done) < len(ft_procs):
+            time.sleep(10)
+            for key, (proc, log_file) in ft_procs.items():
+                if key in ft_done:
+                    continue
+                ret = proc.poll()
+                if ret is not None:
+                    ft_done.add(key)
+                    status = "OK" if ret == 0 else f"FAIL (exit {ret})"
+                    results[key] = status
+                    print(f"  Finished: {key} -> {status}")
+
+        n_ft_ok = sum(1 for k in ft_done if results[k] == "OK")
+        print(f"\n  {n_ft_ok}/{len(specs)} fine-tunes succeeded.")
+
+        if n_ft_ok == 0:
+            print("  No FTs succeeded. Aborting.")
+            return results
+    else:
+        print(f"\n{'=' * 70}")
+        print(f"SKIPPING PHASE 1 (--eval-only)")
+        print(f"{'=' * 70}")
+
+    # ---- Phase 2: Eval jobs (cotcontrol first, then reasonif) ----
+    # Build eval job queue: all cotcontrol evals first, then all reasonif
+    eval_jobs: list[tuple[FTModelSpec, str]] = []
+    for dataset_cfg in EVAL_DATASETS:
+        ds = dataset_cfg["dataset"]
+        for spec in specs:
+            # Skip if FT failed
+            ft_key = f"ft_{spec.short_name}"
+            if not eval_only and results.get(ft_key) != "OK":
+                print(f"  Skipping eval for {spec.short_name} (FT failed)")
+                continue
+            eval_jobs.append((spec, ds))
+
+    print(f"\n{'=' * 70}")
+    print(f"PHASE 2: Evaluations ({len(eval_jobs)} jobs, max {max_eval_workers} concurrent)")
+    print(f"{'=' * 70}")
+    for i, (spec, ds) in enumerate(eval_jobs, 1):
+        print(f"  {i}. {spec.short_name} on {ds}")
+
+    # Run with subprocess pool
+    active: dict[str, tuple[subprocess.Popen, Path]] = {}
+    pending = list(eval_jobs)
+
+    def launch_next_eval():
+        if not pending:
+            return
+        spec, ds = pending.pop(0)
+        job_key = f"eval_{spec.short_name}_{ds}"
+        log_file = RESULTS_DIR / f"ft_v4_{spec.short_name}_eval_{ds}.log"
+        cmd = [
+            sys.executable, str(SCRIPT_PATH),
+            "--single-eval", spec.short_name,
+            "--dataset", ds,
+            "--run-id", run_id,
+        ]
+        print(f"\n  Launching: {job_key} (log: {log_file})")
+        active[job_key] = (_launch_subprocess(cmd, log_file), log_file)
+
+    # Fill initial slots
+    for _ in range(min(max_eval_workers, len(pending))):
+        launch_next_eval()
+
+    # Poll for completions
+    while active:
+        time.sleep(10)
+        done_keys = []
+        for key, (proc, log_file) in active.items():
+            ret = proc.poll()
+            if ret is not None:
+                done_keys.append(key)
+                status = "OK" if ret == 0 else f"FAIL (exit {ret})"
+                results[key] = status
+                print(f"  Finished: {key} -> {status}")
+
+        for key in done_keys:
+            del active[key]
+
+        while pending and len(active) < max_eval_workers:
+            launch_next_eval()
+
+    return results
 
 
 # --------------------------------------------------------------------------- #
 # Dry Run
 # --------------------------------------------------------------------------- #
 
-def print_dry_run(specs: list[FTModelSpec], lr_configs: list[dict], run_id: str) -> None:
+def print_dry_run(specs: list[FTModelSpec], run_id: str) -> None:
     print(f"\n{'=' * 70}")
     print(f"DRY RUN — Execution Plan (run_id={run_id})")
     print(f"{'=' * 70}")
 
-    total_ft = len(specs) * len(lr_configs)
-    print(f"\n{total_ft} fine-tune runs ({len(specs)} models x {len(lr_configs)} LRs)\n")
-
-    job_num = 0
-    for lr_cfg in lr_configs:
-        lr = lr_cfg["lr"]
-        lr_label = lr_cfg["label"]
-        print(f"  --- LR = {lr} ({lr_label}) ---")
-        for spec in specs:
-            job_num += 1
-            parquet_path = SFT_DIR / spec.parquet
-            log_path = _log_path_for(spec, lr_label, run_id)
-            parquet_exists = parquet_path.exists()
-
-            print(f"\n  {job_num}. {spec.model}")
-            print(f"     Base model:  {spec.base_model}")
-            print(f"     Renderer:    {spec.renderer_type} (effort={spec.reasoning_effort})")
-            print(f"     Parquet:     {parquet_path} {'[OK]' if parquet_exists else '[MISSING]'}")
-            print(f"     Log path:    {log_path}")
-            print(f"     Training:    lr={lr}, batch_size={BATCH_SIZE}, "
-                  f"lora_rank={LORA_RANK}, epochs={NUM_EPOCHS}")
-            print(f"     Eval:        reasonif (all 300) + cotcontrol (100 stratified)")
+    print(f"\nPhase 1: Fine-tuning (4 models in parallel)")
+    print(f"  LoRA rank={LORA_RANK}, lr={LEARNING_RATE}, n_examples={N_TRAIN_EXAMPLES}")
+    print(f"  Batch size={BATCH_SIZE}, epochs={NUM_EPOCHS}, max_length={MAX_LENGTH}")
+    print()
+    for spec in specs:
+        parquet_path = SFT_DIR / spec.parquet
+        log_path = _log_path_for(spec, run_id)
+        exists = parquet_path.exists()
+        print(f"  {spec.short_name}")
+        print(f"    Base:     {spec.base_model}")
+        print(f"    Parquet:  {parquet_path} {'[OK]' if exists else '[MISSING]'}")
+        print(f"    Log:      {log_path}")
+        print(f"    Renderer: {spec.renderer_type} (effort={spec.reasoning_effort})")
         print()
 
-    total_evals = total_ft * 4 * 2  # 4 checkpoints x 2 datasets
-    print(f"Total: {total_ft} training runs, ~{total_evals} eval runs")
-    print(f"  (4 checkpoints/model x 2 datasets x {total_ft} models)\n")
+    print(f"Phase 2: Evaluations (max 3 concurrent)")
+    print(f"  CotControl first (100 stratified samples), then ReasonIF (all 300)")
+    print()
+    n = 0
+    for ds_cfg in EVAL_DATASETS:
+        ds = ds_cfg["dataset"]
+        ns = ds_cfg["n_samples"]
+        for spec in specs:
+            n += 1
+            print(f"  {n}. {spec.short_name} on {ds} (n_samples={ns or 'all'})")
+
+    # Estimate total checkpoint evals
+    print(f"\n  Each model produces ~4 checkpoints -> ~{n * 4} checkpoint eval runs total\n")
 
 
 # --------------------------------------------------------------------------- #
 # Logging
 # --------------------------------------------------------------------------- #
 
-def _setup_logging() -> None:
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+def _setup_logging(log_file: Path | None = None) -> None:
+    target = log_file or LOG_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter(
         "[%(asctime)s] %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    file_handler = logging.FileHandler(LOG_FILE, mode="a")
+    file_handler = logging.FileHandler(target, mode="a")
     file_handler.setFormatter(formatter)
 
     stream_handler = logging.StreamHandler(sys.stdout)
@@ -476,25 +635,46 @@ def _setup_logging() -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Overnight FT + Eval v2: train models at two LRs, eval checkpoints"
+        description="Overnight FT + Eval v4: LoRA rank 1, 240 examples, lr=1e-4"
     )
     parser.add_argument("--eval-only", action="store_true",
                         help="Skip training, only eval existing checkpoints")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print execution plan without running")
     parser.add_argument("--models", type=str, default=None,
-                        help="Comma-separated model short names (e.g., gpt-oss-20b,qwen3-8b)")
-    parser.add_argument("--lrs", type=str, default=None,
-                        help="Comma-separated LR labels to run (e.g., lr4e-4,lr2.5e-5)")
+                        help="Comma-separated model short names")
     parser.add_argument("--run-id", type=str, default=None,
                         help="Reuse a previous run ID for resume")
-    parser.add_argument("--delay", type=int, default=0,
-                        help="Seconds to wait before starting (e.g., 3600 for 1hr)")
-    args = parser.parse_args()
+    parser.add_argument("--max-eval-workers", type=int, default=3,
+                        help="Max concurrent eval jobs (default: 3)")
 
+    # Internal single-job modes
+    parser.add_argument("--single-ft", type=str, default=None,
+                        help="Internal: run a single FT job")
+    parser.add_argument("--single-eval", type=str, default=None,
+                        help="Internal: run a single eval job")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Internal: dataset for --single-eval")
+
+    args = parser.parse_args()
     run_id = args.run_id or RUN_ID
 
-    _setup_logging()
+    # --- Single FT mode ---
+    if args.single_ft:
+        spec = _get_spec_by_short_name(args.single_ft)
+        run_single_ft(spec, run_id)
+        return
+
+    # --- Single eval mode ---
+    if args.single_eval:
+        spec = _get_spec_by_short_name(args.single_eval)
+        if not args.dataset:
+            print("ERROR: --single-eval requires --dataset")
+            sys.exit(1)
+        run_single_eval(spec, args.dataset, run_id)
+        return
+
+    # --- Normal mode ---
 
     # Filter models
     specs = list(FT_MODELS)
@@ -502,79 +682,38 @@ def main():
         requested = {m.strip() for m in args.models.split(",")}
         specs = [s for s in specs if s.short_name in requested]
         if not specs:
-            print(f"ERROR: No matching models for --models={args.models}")
-            print(f"Available: {', '.join(s.short_name for s in FT_MODELS)}")
-            sys.exit(1)
-
-    # Filter LRs
-    lr_configs = list(LR_CONFIGS)
-    if args.lrs:
-        requested_lrs = {l.strip() for l in args.lrs.split(",")}
-        lr_configs = [c for c in lr_configs if c["label"] in requested_lrs]
-        if not lr_configs:
-            print(f"ERROR: No matching LRs for --lrs={args.lrs}")
-            print(f"Available: {', '.join(c['label'] for c in LR_CONFIGS)}")
+            print(f"ERROR: No matching models. Available: {', '.join(s.short_name for s in FT_MODELS)}")
             sys.exit(1)
 
     if args.dry_run:
-        print_dry_run(specs, lr_configs, run_id)
+        print_dry_run(specs, run_id)
         return
 
-    # Delay
-    if args.delay > 0:
-        logging.info("Waiting %d seconds before starting...", args.delay)
-        time.sleep(args.delay)
-        logging.info("Delay complete, starting now.")
-
+    _setup_logging()
     start_time = datetime.now(timezone.utc)
-    total_jobs = len(specs) * len(lr_configs)
-    logging.info(
-        "Overnight FT + Eval v2: %d models x %d LRs = %d jobs, "
-        "eval_only=%s, run_id=%s",
-        len(specs), len(lr_configs), total_jobs, args.eval_only, run_id,
-    )
+    logging.info("Overnight FT + Eval v4: run_id=%s, %d models", run_id, len(specs))
 
-    results: dict[str, str] = {}
+    # Check parquets exist
+    for spec in specs:
+        parquet_path = SFT_DIR / spec.parquet
+        if not parquet_path.exists():
+            logging.error("Missing parquet: %s", parquet_path)
+            sys.exit(1)
 
-    for lr_cfg in lr_configs:
-        lr = lr_cfg["lr"]
-        lr_label = lr_cfg["label"]
-
-        for spec in specs:
-            job_key = f"{spec.model} ({lr_label})"
-            job_start = datetime.now(timezone.utc)
-            logging.info("START: %s", job_key)
-
-            try:
-                if not args.eval_only:
-                    parquet_path = SFT_DIR / spec.parquet
-                    if not parquet_path.exists():
-                        raise FileNotFoundError(f"Parquet not found: {parquet_path}")
-                    do_train(spec, lr, lr_label, run_id)
-
-                do_eval_checkpoints(spec, lr_label, run_id)
-
-                elapsed = (datetime.now(timezone.utc) - job_start).total_seconds()
-                results[job_key] = f"OK ({elapsed:.0f}s)"
-                logging.info("DONE  %s — %s", job_key, results[job_key])
-
-            except Exception as e:
-                elapsed = (datetime.now(timezone.utc) - job_start).total_seconds()
-                results[job_key] = f"FAIL ({type(e).__name__}: {e}, {elapsed:.0f}s)"
-                logging.error("FAIL  %s — %s", job_key, results[job_key], exc_info=True)
+    results = run_pool(specs, run_id, args.max_eval_workers, args.eval_only)
 
     # Summary
     elapsed_total = (datetime.now(timezone.utc) - start_time).total_seconds()
     summary = [
         "",
         "=" * 70,
-        f"OVERNIGHT FT + EVAL v2 COMPLETE — {elapsed_total:.0f}s total",
+        f"OVERNIGHT FT + EVAL v4 COMPLETE — {elapsed_total:.0f}s total",
         "=" * 70,
     ]
     for key, status in results.items():
         summary.append(f"  {key:50s} {status}")
 
-    n_ok = sum(1 for s in results.values() if s.startswith("OK"))
+    n_ok = sum(1 for s in results.values() if s == "OK")
     n_fail = sum(1 for s in results.values() if s.startswith("FAIL"))
     summary.append(f"\n  {n_ok} succeeded, {n_fail} failed")
 

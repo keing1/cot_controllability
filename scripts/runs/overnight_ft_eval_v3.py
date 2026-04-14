@@ -484,9 +484,7 @@ def do_eval_checkpoints(spec: FTModelSpec, lr_label: str, run_id: str) -> None:
             )
             output_path = Path(output_dir) / custom_filename
 
-            config.__class__.output_filename = property(
-                lambda self, fn=custom_filename: fn
-            )
+            config.output_filename_override = custom_filename
 
             logging.info("  Output: %s", output_path)
             asyncio.run(run_experiment(config))

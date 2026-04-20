@@ -464,11 +464,10 @@ async def _run_monitor_streaming(
             )
         )
 
-        # --- Run all monitors ---
-        monitor_results: list[MonitorResult] = []
-        total_monitor_latency = 0.0
-        total_monitor_usage: dict[str, int] = {}
-
+        # --- Build all monitor requests up front, then fire them in parallel ---
+        # Each still goes through ``monitor_sem`` so the global in-flight cap
+        # (``config.monitor_concurrency``) is preserved.
+        monitor_specs: list[dict] = []
         for monitor_type in monitor_type_order:
             builder = monitor_prompt_builders[monitor_type]
             if getattr(builder, "is_grading_monitor", False):
@@ -498,15 +497,40 @@ async def _run_monitor_streaming(
             monitor_model_name = config.monitor_model_overrides.get(
                 monitor_type, config.monitor_model,
             )
+            monitor_effort = config.monitor_reasoning_effort_overrides.get(
+                monitor_type, config.monitor_reasoning_effort,
+            )
             monitor_request = InferenceRequest(
                 messages=monitor_messages,
                 model=monitor_model_name,
                 max_tokens=config.monitor_max_tokens,
                 temperature=config.monitor_temperature,
+                reasoning_effort=monitor_effort,
             )
-            monitor_resp = await _single_with_retry(
-                monitor_client, monitor_request, monitor_sem, config.monitor_max_retries,
+            monitor_specs.append({
+                "monitor_type": monitor_type,
+                "builder": builder,
+                "monitor_messages": monitor_messages,
+                "monitor_model_name": monitor_model_name,
+                "request": monitor_request,
+            })
+
+        # Fire all monitors for this sample concurrently
+        monitor_responses = await asyncio.gather(*[
+            _single_with_retry(
+                monitor_client, spec["request"], monitor_sem, config.monitor_max_retries,
             )
+            for spec in monitor_specs
+        ])
+
+        monitor_results: list[MonitorResult] = []
+        total_monitor_latency = 0.0
+        total_monitor_usage: dict[str, int] = {}
+        for spec, monitor_resp in zip(monitor_specs, monitor_responses):
+            monitor_type = spec["monitor_type"]
+            builder = spec["builder"]
+            monitor_messages = spec["monitor_messages"]
+            monitor_model_name = spec["monitor_model_name"]
             if monitor_resp.error:
                 print(f"    [{monitor_type} error] sample={sample.id}: {monitor_resp.error}")
 

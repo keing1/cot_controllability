@@ -14,6 +14,7 @@ REASONING_MODEL_PATTERNS = (
     "qwen3",
     "qwen3.5",
     "gpt-oss",
+    "gpt-5",
     "deepseek-r1",
     "o1",
     "o3",
@@ -25,7 +26,13 @@ REASONING_MODEL_PATTERNS = (
 REASONING_SIMPLE_FLAG_PATTERNS = ("kimi",)
 
 # Models that support `reasoning.effort` ("low"/"medium"/"high") instead of max_tokens
-REASONING_EFFORT_PATTERNS = ("gpt-oss", "o1", "o3", "o4")
+REASONING_EFFORT_PATTERNS = ("gpt-oss", "gpt-5", "o1", "o3", "o4")
+
+# Effort-based models that ALSO support a non-reasoning mode. For these,
+# reasoning_effort=None means "don't think" (no reasoning block is sent).
+# Effort-based models NOT listed here are reasoning-only — passing None
+# raises rather than silently falling through.
+OPTIONAL_REASONING_PATTERNS = ("gpt-5",)
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -73,16 +80,29 @@ class OpenRouterClient:
             "temperature": request.temperature,
         }
 
-        # Add reasoning budget for reasoning models
+        # Add reasoning budget for reasoning models. Per-request override takes
+        # precedence over the client-wide default.
+        effort = request.reasoning_effort or self.reasoning_effort
+        model_lower = request.model.lower()
         if _is_reasoning_model(request.model):
-            if any(p in request.model.lower() for p in REASONING_SIMPLE_FLAG_PATTERNS):
+            if any(p in model_lower for p in REASONING_SIMPLE_FLAG_PATTERNS):
                 payload["include_reasoning"] = True
-            elif (
-                self.reasoning_effort
-                and any(p in request.model.lower() for p in REASONING_EFFORT_PATTERNS)
-            ):
-                payload["reasoning"] = {"effort": self.reasoning_effort}
+            elif any(p in model_lower for p in REASONING_EFFORT_PATTERNS):
+                # Effort-based reasoning.
+                if effort:
+                    payload["reasoning"] = {"effort": effort}
+                elif any(p in model_lower for p in OPTIONAL_REASONING_PATTERNS):
+                    # Reasoning is optional for this model — no block = no thinking.
+                    pass
+                else:
+                    raise ValueError(
+                        f"Model {request.model!r} is reasoning-only and requires "
+                        "a reasoning_effort ('low'/'medium'/'high'/'minimal'). "
+                        "Set it on the InferenceRequest or on the OpenRouterClient."
+                    )
             else:
+                # Token-budget reasoning models (qwen3, deepseek-r1) — always
+                # attach the default budget so the model thinks.
                 payload["reasoning"] = {"max_tokens": self.default_reasoning_tokens}
 
         headers = {

@@ -27,7 +27,7 @@ matplotlib.rcParams["font.size"] = 11
 # ---------------------------------------------------------------------------
 
 ROLLOUTS_DIR = Path("results/rollouts/monitor_qa")
-DATE = "20260413v4"
+DATE = "2026_04_13_v4"
 OUTDIR = Path(f"results/summaries/plots/{DATE}")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 

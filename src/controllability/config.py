@@ -45,6 +45,7 @@ class ExperimentConfig(BaseSettings):
     request_timeout: int = 300  # Per-request timeout in seconds (not in experiment_id)
     analysis_channel: bool = True  # Use "analysis channel" instead of "reasoning" in ReasonIF prompts
     word_suppression_synonyms: bool = False  # Include synonyms in word_suppression prompt & grading (paper mode)
+    output_filename_override: str | None = None  # If set, use this filename instead of auto-generated
 
     @property
     def experiment_id(self) -> str:
@@ -72,9 +73,12 @@ class ExperimentConfig(BaseSettings):
     def output_filename(self) -> str:
         """Generate output filename from config.
 
-        Reuses an existing file matching the experiment_id (for resume support).
-        Creates a new timestamped filename only on first run.
+        If ``output_filename_override`` is set, it wins. Otherwise reuse an
+        existing file matching the experiment_id (for resume support), or
+        create a new timestamped filename.
         """
+        if self.output_filename_override:
+            return self.output_filename_override
         model_short = self.model.replace("/", "_")
         dataset_short = self.dataset.replace("/", "_")
         prefix = f"{model_short}_{dataset_short}_{self.split}_{self.experiment_id}"
@@ -117,6 +121,12 @@ class MonitorQAConfig(BaseSettings):
     prompt_type: str = "default"
     monitor_types: list[str] = Field(default_factory=lambda: ["metr_note"])
     monitor_model_overrides: dict[str, str] = Field(default_factory=dict)  # monitor_type -> model name
+    # Default reasoning effort for monitor calls (e.g. "low"/"medium"/"high"
+    # for gpt-5.x / gpt-oss / o-series). None = no reasoning (legacy behavior).
+    monitor_reasoning_effort: str | None = None
+    # Per-monitor-type reasoning effort overrides (monitor_type -> effort).
+    # Takes precedence over monitor_reasoning_effort for that monitor type.
+    monitor_reasoning_effort_overrides: dict[str, str] = Field(default_factory=dict)
 
     # Modes
     modes: list[str] = Field(default_factory=lambda: ["side_task"])
@@ -147,6 +157,10 @@ class MonitorQAConfig(BaseSettings):
                 "monitor_types": sorted(self.monitor_types),
                 "model_path": self.model_path,
                 "reasoning_effort": self.reasoning_effort,
+                "monitor_reasoning_effort": self.monitor_reasoning_effort,
+                "monitor_reasoning_effort_overrides": dict(
+                    sorted(self.monitor_reasoning_effort_overrides.items())
+                ),
             },
             sort_keys=True,
         )

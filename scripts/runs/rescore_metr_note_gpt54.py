@@ -29,23 +29,27 @@ from controllability.inference.openrouter import OpenRouterClient
 from controllability.types import InferenceRequest
 
 ROLLOUT_DIR = Path(__file__).resolve().parents[2] / "results" / "rollouts" / "monitor_qa"
-MONITOR_TYPE = "metr_note_gpt54"
+DEFAULT_MONITOR_TYPE = "metr_note_gpt54"
+DEFAULT_PROMPT_TYPE = "metr_note"
 
 
 async def rescore_file(
     path: Path,
     monitor_client: OpenRouterClient,
     *,
+    monitor_type: str,
+    prompt_type: str,
     monitor_model: str,
     monitor_max_tokens: int,
     monitor_temperature: float,
+    monitor_reasoning_effort: str | None,
     concurrency: int,
     max_retries: int,
     backup_dir: Path | None,
     rescore_le: float | None,
 ) -> dict:
-    """Add metr_note_gpt54 scores to all eligible rollouts in a single JSONL file."""
-    builder = get_monitor_prompt_builder("metr_note")
+    """Add `monitor_type` scores to all eligible rollouts in a single JSONL file."""
+    builder = get_monitor_prompt_builder(prompt_type)
     sem = asyncio.Semaphore(concurrency)
 
     # Read all lines
@@ -65,7 +69,7 @@ async def rescore_file(
                 continue
 
     # Identify which rollouts need scoring.
-    # Rescore if: no entry for MONITOR_TYPE, OR entry exists but score is None.
+    # Rescore if: no entry for monitor_type, OR entry exists but score is None.
     to_score: list[int] = []
     for i, r in enumerate(rollout_lines):
         if r.get("actor_error"):
@@ -73,7 +77,7 @@ async def rescore_file(
         existing_score = None
         has_any = False
         for mr in r.get("monitor_results", []):
-            if mr.get("monitor_type") == MONITOR_TYPE:
+            if mr.get("monitor_type") == monitor_type:
                 has_any = True
                 existing_score = mr.get("monitor_score")
                 break
@@ -87,7 +91,7 @@ async def rescore_file(
 
     logging.info(
         "  %s: %d rollouts, %d to score with %s",
-        path.name, len(rollout_lines), len(to_score), MONITOR_TYPE,
+        path.name, len(rollout_lines), len(to_score), monitor_type,
     )
 
     if not to_score:
@@ -109,6 +113,7 @@ async def rescore_file(
             model=monitor_model,
             max_tokens=monitor_max_tokens,
             temperature=monitor_temperature,
+            reasoning_effort=monitor_reasoning_effort,
         )
         resp = await _single_with_retry(monitor_client, request, sem, max_retries)
         score = builder.parse_score(resp.content)
@@ -128,10 +133,10 @@ async def rescore_file(
         # Drop any existing stale (None-score) entry for this monitor type
         r["monitor_results"] = [
             mr for mr in r["monitor_results"]
-            if mr.get("monitor_type") != MONITOR_TYPE
+            if mr.get("monitor_type") != monitor_type
         ]
         r["monitor_results"].append({
-            "monitor_type": MONITOR_TYPE,
+            "monitor_type": monitor_type,
             "monitor_model": monitor_model,
             "monitor_prompt": [],
             "monitor_response": response_text,
@@ -177,8 +182,9 @@ async def main_async(args):
         return
 
     logging.info(
-        "Scoring %d file(s) with %s monitor (model=%s, concurrency=%d)",
-        len(files), MONITOR_TYPE, args.monitor_model, args.concurrency,
+        "Scoring %d file(s) with %s monitor (prompt=%s, model=%s, effort=%s, concurrency=%d)",
+        len(files), args.monitor_type, args.prompt_type, args.monitor_model,
+        args.monitor_reasoning_effort, args.concurrency,
     )
 
     try:
@@ -188,9 +194,12 @@ async def main_async(args):
             summary = await rescore_file(
                 path,
                 monitor_client,
+                monitor_type=args.monitor_type,
+                prompt_type=args.prompt_type,
                 monitor_model=args.monitor_model,
                 monitor_max_tokens=args.monitor_max_tokens,
                 monitor_temperature=args.monitor_temperature,
+                monitor_reasoning_effort=args.monitor_reasoning_effort,
                 concurrency=args.concurrency,
                 max_retries=args.max_retries,
                 backup_dir=Path(args.backup_dir) if args.backup_dir else None,
@@ -208,7 +217,7 @@ async def main_async(args):
 
     logging.info("")
     logging.info("=" * 60)
-    logging.info("%s SCORING COMPLETE", MONITOR_TYPE.upper())
+    logging.info("%s SCORING COMPLETE", args.monitor_type.upper())
     logging.info("=" * 60)
     total_scored = 0
     total_errors = 0
@@ -220,11 +229,36 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description=f"Add {MONITOR_TYPE} monitor scores to existing monitor_qa rollouts"
+        description="Add a gpt-5.4 monitor score to existing monitor_qa rollouts"
+    )
+    parser.add_argument(
+        "--monitor-type",
+        type=str,
+        default=DEFAULT_MONITOR_TYPE,
+        help=(
+            "Label written into MonitorResult.monitor_type. Defaults to "
+            f"{DEFAULT_MONITOR_TYPE!r}. Use distinct labels when running the "
+            "same prompt with different efforts (e.g. metr_note_gpt54_thinking)."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-type",
+        type=str,
+        default=DEFAULT_PROMPT_TYPE,
+        help="Monitor prompt builder name (e.g. metr_note, metr_note_v2).",
     )
     parser.add_argument("--monitor-model", type=str, default="openai/gpt-5.4")
     parser.add_argument("--monitor-max-tokens", type=int, default=1024)
     parser.add_argument("--monitor-temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--monitor-reasoning-effort",
+        type=str,
+        default=None,
+        help=(
+            "Reasoning effort for monitor calls ('low'/'medium'/'high'/'minimal'). "
+            "Required for gpt-5.x / gpt-oss / o-series to think. Default: no thinking."
+        ),
+    )
     parser.add_argument("--concurrency", type=int, default=200)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=120)
@@ -270,7 +304,7 @@ def main():
                     existing_score = None
                     has_any = False
                     for mr in r.get("monitor_results", []):
-                        if mr.get("monitor_type") == MONITOR_TYPE:
+                        if mr.get("monitor_type") == args.monitor_type:
                             has_any = True
                             existing_score = mr.get("monitor_score")
                             break

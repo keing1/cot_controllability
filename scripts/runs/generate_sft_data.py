@@ -73,6 +73,7 @@ from controllability.inference.batch import run_batch
 from controllability.inference.openrouter import OpenRouterClient
 from controllability.training.transforms import (
     LLM_TRANSFORMS,
+    TransformContext,
     apply_transform,
     filter_constraint_args,
 )
@@ -426,8 +427,9 @@ async def stage2_transform_and_verify(
             constraint_args = filter_constraint_args(raw_args_dict)
 
             try:
-                transformed_reasoning = await apply_transform(
-                    constraint_name, reasoning, constraint_args, llm_client
+                transformed_reasoning, _ = await apply_transform(
+                    constraint_name, reasoning, constraint_args,
+                    TransformContext(llm_client=llm_client),
                 )
             except Exception as e:
                 last_error = f"Transform failed: {e}"

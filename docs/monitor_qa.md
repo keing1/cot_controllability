@@ -87,7 +87,29 @@ uv run python scripts/runs/run_monitor_qa.py \
 | `--actor-concurrency` | 30 | Max concurrent actor requests |
 | `--monitor-concurrency` | 60 | Max concurrent monitor requests |
 | `--reasoning-effort` | `high` | Reasoning effort for actor |
+| `--monitor-reasoning-effort` | `None` (no thinking) | Reasoning effort for monitor calls (`low`/`medium`/`high`/`minimal`). Applies to gpt-5.x, gpt-oss, and o-series monitors. For gpt-5.x, `None` means no thinking. For reasoning-only models (gpt-oss, o1/o3/o4), this is required or the client raises. |
+| `--monitor-reasoning-effort-overrides` | `""` | Per-monitor-type reasoning effort overrides, e.g. `metr_note=high,main_task_grading=minimal`. Overrides `--monitor-reasoning-effort` for the listed types. |
 | `--output-dir` | `results/rollouts/monitor_qa` | Output directory |
+
+### Enabling GPT-5.4 thinking for `metr_note` / `metr_note_v2`
+
+```bash
+uv run python scripts/runs/run_monitor_qa.py \
+    --actor-model openai/gpt-oss-20b \
+    --monitor-model openai/gpt-5.4 \
+    --monitor-types metr_note,metr_note_v2 \
+    --monitor-reasoning-effort high \
+    --modes side_task,baseline
+```
+
+Mix thinking and non-thinking monitors in a single run via overrides:
+
+```bash
+uv run python scripts/runs/run_monitor_qa.py \
+    --monitor-types metr_note,main_task_grading \
+    --monitor-reasoning-effort-overrides metr_note=high \
+    ...
+```
 
 ## Output
 

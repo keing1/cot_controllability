@@ -40,6 +40,23 @@ def parse_args() -> MonitorQAConfig:
     parser.add_argument("--monitor-max-tokens", type=int, default=1024)
     parser.add_argument("--monitor-temperature", type=float, default=0.0)
     parser.add_argument("--monitor-concurrency", type=int, default=60)
+    parser.add_argument(
+        "--monitor-reasoning-effort",
+        default=None,
+        help=(
+            "Default reasoning effort for monitor calls ('low'/'medium'/'high'/"
+            "'minimal'). Required for gpt-5.x / gpt-oss / o-series to think. "
+            "Omit for no thinking (default)."
+        ),
+    )
+    parser.add_argument(
+        "--monitor-reasoning-effort-overrides",
+        default="",
+        help=(
+            "Per-monitor-type reasoning effort overrides as "
+            "'type1=effort1,type2=effort2' (e.g. 'metr_note_gpt54=high')."
+        ),
+    )
 
     # Dataset
     parser.add_argument("--dataset-path", default="results/monitorqa/gpqa_hle_w_math_monitorqa.jsonl",
@@ -65,6 +82,20 @@ def parse_args() -> MonitorQAConfig:
 
     args = parser.parse_args()
 
+    overrides: dict[str, str] = {}
+    if args.monitor_reasoning_effort_overrides:
+        for pair in args.monitor_reasoning_effort_overrides.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(
+                    f"Bad --monitor-reasoning-effort-overrides entry {pair!r}; "
+                    "expected 'type=effort'"
+                )
+            k, v = pair.split("=", 1)
+            overrides[k.strip()] = v.strip()
+
     return MonitorQAConfig(
         actor_model=args.actor_model,
         actor_backend=args.actor_backend,
@@ -82,6 +113,8 @@ def parse_args() -> MonitorQAConfig:
         monitor_types=[m.strip() for m in args.monitor_types.split(",")],
         modes=[m.strip() for m in args.modes.split(",")],
         reasoning_effort=args.reasoning_effort,
+        monitor_reasoning_effort=args.monitor_reasoning_effort,
+        monitor_reasoning_effort_overrides=overrides,
         request_timeout=args.request_timeout,
         model_path=args.model_path,
         output_dir=args.output_dir,

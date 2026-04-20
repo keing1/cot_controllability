@@ -21,6 +21,7 @@ import streamlit as st
 SFT_DIR = Path(__file__).resolve().parents[2] / "results" / "sft"
 
 CNAME_TO_SHORT = {
+    # ReasonIF canonical names (legacy "category:short")
     "punctuation:no_comma": "no_comma",
     "length_constraint_checkers:number_words": "number_words",
     "detectable_format:json_format": "json_format",
@@ -28,14 +29,30 @@ CNAME_TO_SHORT = {
     "change_style:english_capital": "english_capital",
     "startend:end_checker": "end_checker",
     "language:reasoning_language": "reasoning_language",
+    # CoTControl names emitted by the mixed-source builder
+    "cotcontrol:word_suppression": "word_suppression",
+    "cotcontrol:multiple_word_suppression": "multiple_word_suppression",
+    "cotcontrol:uppercase_thinking": "uppercase_thinking",
+    "cotcontrol:lowercase_thinking": "lowercase_thinking",
+    "cotcontrol:alternating_case": "alternating_case",
+    "cotcontrol:end_of_sentence": "end_of_sentence",
+    "cotcontrol:meow_between_words": "meow_between_words",
+    "cotcontrol:repeat_sentences": "repeat_sentences",
+    "cotcontrol:ignore_question": "ignore_question",
 }
 
-# Model name from filename: e.g. "gpt-oss-20b-reasonif-sft.parquet" -> "GPT-OSS-20B"
-# Also handles suffixes like "-stripped", "-stripped-ac"
-_MODEL_RE = re.compile(r"^(.+?)-reasonif-sft(?:-[a-z]+)*\.parquet$")
+# Model name from filename: e.g. "gpt-oss-20b-reasonif-sft.parquet" -> "GPT-OSS-20B".
+# Accepts any composition tag (reasonif / cotcontrol / mixed) and optional
+# suffixes like "-stripped", "-stripped-ac".
+_COMPOSITION_RE = r"(?:reasonif|cotcontrol|mixed[0-9a-z]*)"
+_MODEL_RE = re.compile(rf"^(.+?)-{_COMPOSITION_RE}-sft(?:-[a-z]+)*\.parquet$")
+_VARIANT_RE = re.compile(rf"-{_COMPOSITION_RE}-sft((?:-[a-z]+)*)\.parquet$")
+_COMPOSITION_EXTRACT_RE = re.compile(rf"-({_COMPOSITION_RE})-sft(?:-[a-z]+)*\.parquet$")
 
-# Variant parsing: extract (stripped, ac) from filename suffix
-_VARIANT_RE = re.compile(r"-reasonif-sft((?:-[a-z]+)*)\.parquet$")
+
+def _parse_composition(filename: str) -> str:
+    m = _COMPOSITION_EXTRACT_RE.search(filename)
+    return m.group(1) if m else "unknown"
 
 
 def _parse_variant(filename: str) -> tuple[bool, bool]:
@@ -100,8 +117,9 @@ def _extract_parts(messages):
 
 
 @st.cache_data
-def discover_files() -> list[tuple[str, str, Path, bool, bool]]:
-    """Return list of (model_label, filename, path, is_stripped, is_ac) for all SFT parquets."""
+def discover_files() -> list[tuple[str, str, Path, bool, bool, str]]:
+    """Return (model_label, filename, path, is_stripped, is_ac, composition)
+    for every SFT parquet under ``results/sft``."""
     if not SFT_DIR.exists():
         return []
     results = []
@@ -109,8 +127,22 @@ def discover_files() -> list[tuple[str, str, Path, bool, bool]]:
         model = _model_from_filename(p.name)
         if model:
             stripped, ac = _parse_variant(p.name)
-            results.append((model, p.name, p, stripped, ac))
+            comp = _parse_composition(p.name)
+            results.append((model, p.name, p, stripped, ac, comp))
     return results
+
+
+@st.cache_data
+def load_build_metadata(path: str) -> dict | None:
+    """Load the .meta.json sidecar next to a parquet, if present."""
+    sidecar = Path(path + ".meta.json")
+    if not sidecar.exists():
+        return None
+    try:
+        with open(sidecar) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 @st.cache_data
@@ -141,6 +173,16 @@ with st.sidebar:
 
     # Files matching model
     matching = [f for f in all_files if f[0] == sel_model]
+
+    # Composition filter (reasonif / cotcontrol / mixed)
+    available_comps = sorted({f[5] for f in matching})
+    if len(available_comps) > 1:
+        sel_comp = st.radio(
+            "Composition", available_comps, horizontal=True,
+        )
+        matching = [f for f in matching if f[5] == sel_comp]
+    elif len(available_comps) == 1:
+        st.caption(f"Composition: **{available_comps[0]}**")
 
     # Variant filters (only show options that exist for this model)
     available_stripped = sorted({f[3] for f in matching})
@@ -178,11 +220,17 @@ with st.sidebar:
     if len(matching) == 1:
         sel_file = matching[0]
     else:
-        file_names = [name for _, name, _, _, _ in matching]
+        file_names = [name for _, name, _, _, _, _ in matching]
         sel_name = st.selectbox("File", file_names)
         sel_file = next(f for f in matching if f[1] == sel_name)
 
     st.caption(f"`{sel_file[1]}`")
+
+    # Build metadata sidecar (if present)
+    build_meta = load_build_metadata(str(sel_file[2]))
+    if build_meta is not None:
+        with st.expander("Build config (from sidecar)"):
+            st.json(build_meta, expanded=False)
 
 # ---- Load data -----------------------------------------------------------
 
@@ -261,12 +309,14 @@ if isinstance(cargs, dict):
 instruction_desc = _get_val(row.get("instruction_description", ""))
 
 # Metadata bar
-meta_cols = st.columns(3)
+meta_cols = st.columns(4)
+row_source = _get_val(row.get("source", "")) if "source" in row.index else ""
 meta_cols[0].markdown(f"**Instruction Type:** `{itype}`")
+meta_cols[1].markdown(f"**Source:** `{row_source or 'n/a'}`")
 if cargs:
-    meta_cols[1].markdown(f"**Constraint Args:** `{cargs}`")
+    meta_cols[2].markdown(f"**Constraint Args:** `{cargs}`")
 if instruction_desc:
-    meta_cols[2].markdown(f"**Description:** {instruction_desc[:100]}")
+    meta_cols[3].markdown(f"**Description:** {instruction_desc[:100]}")
 
 # Prompt
 st.markdown("### Prompt")

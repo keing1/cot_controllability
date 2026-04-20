@@ -38,3 +38,6 @@ uv.lock
 results/rollouts/
 results/
 notebooks/
+.claude/
+scripts/data/
+configs/

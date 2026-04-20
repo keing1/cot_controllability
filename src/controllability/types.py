@@ -28,6 +28,9 @@ class InferenceRequest(BaseModel):
     max_tokens: int = 16384
     temperature: float = 1.0
     prefill: str | None = None  # Assistant prefill text appended before generation
+    # Per-request reasoning override ("low"/"medium"/"high"/"minimal").
+    # When set, overrides the client's default reasoning_effort for this call.
+    reasoning_effort: str | None = None
 
 
 class InferenceResponse(BaseModel):

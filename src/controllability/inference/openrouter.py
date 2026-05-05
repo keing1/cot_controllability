@@ -135,17 +135,38 @@ class OpenRouterClient:
             content = message.get("content", "") or ""
             reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
 
+            # Capture the raw, pre-parse text (full assistant content +
+            # any inlined `<think>` tags) before we strip them out. The
+            # malformed-think classifier needs to see `<think>` /
+            # `</think>` substrings as the model emitted them.
+            raw_response_text = content
+            # Build raw_text including the prefill so substring checks see
+            # the full assistant turn.
+            raw_text = (request.prefill or "") + raw_response_text
+
+            # If the API also returned reasoning_content separately, it
+            # came from before our `content` regex strip, so synthesize a
+            # `<think>...</think>` block into raw_text for consistent
+            # downstream substring checks.
+            if reasoning and "<think>" not in raw_text:
+                raw_text = (
+                    (request.prefill or "")
+                    + f"<think>{reasoning}</think>"
+                    + raw_response_text
+                )
+
             # Some providers embed reasoning in <think> tags within content
             # instead of in reasoning_content. Parse it out.
-            if not reasoning and "<think>" in content:
-                import re
+            if not message.get("reasoning_content") and not message.get("reasoning"):
+                if "<think>" in content:
+                    import re
 
-                think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
-                if think_match:
-                    reasoning = think_match.group(1).strip()
-                    content = re.sub(
-                        r"<think>.*?</think>", "", content, flags=re.DOTALL
-                    ).strip()
+                    think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+                    if think_match:
+                        reasoning = think_match.group(1).strip()
+                        content = re.sub(
+                            r"<think>.*?</think>", "", content, flags=re.DOTALL
+                        ).strip()
 
             usage_data = data.get("usage", {})
             usage = {
@@ -161,6 +182,7 @@ class OpenRouterClient:
             return InferenceResponse(
                 content=content,
                 reasoning=reasoning,
+                raw_text=raw_text,
                 latency_ms=latency_ms,
                 usage=usage,
                 raw_response=data,

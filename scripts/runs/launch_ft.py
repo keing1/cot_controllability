@@ -76,6 +76,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
+
+# Load .env so TINKER_API_KEY / OPENROUTER_API_KEY are visible to both the
+# orchestrator and the recursively-spawned worker subprocesses.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -145,6 +150,10 @@ def _estimate_checkpoint_count(cfg: "LaunchConfig") -> int | None:
     if n_rows is None:
         n_rows = 1000
     total_steps = max(1, (n_rows // cfg.training.batch_size) * cfg.training.num_epochs)
+    if cfg.training.save_at:
+        # +1 for "final" if the last save_at step doesn't coincide with total_steps
+        steps = sorted(cfg.training.save_at)
+        return len(steps) + (0 if steps[-1] == total_steps else 1)
     if cfg.training.save_every is not None:
         se = cfg.training.save_every
     else:
@@ -167,6 +176,12 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     save_fraction: float = 0.25        # save at each quarter of total steps
     save_every: int | None = None      # override if set
+    # Explicit, irregular checkpoint schedule. When set, takes priority over
+    # `save_every` / `save_fraction`. The actual `save_every` passed to Tinker
+    # is the GCD of the list, and save_checkpoint_async is monkey-patched
+    # to no-op periodic saves at steps not in the list (the `final` save is
+    # always emitted at the end of training).
+    save_at: list[int] | None = None
     eval_every: int = 10
     n_train_examples: int | None = None
     adam_beta1: float = 0.9
@@ -189,9 +204,11 @@ class EvalDatasetConfig:
 
     dataset: str
     modes: str | list[str] = "all"
+    exclude_modes: list[str] | None = None  # dropped AFTER modes expansion
     n_samples: int | None = None
     label: str | None = None  # unique per-dataset variant tag
     max_concurrency: int | None = None  # override eval.max_concurrency for std evals
+    request_timeout: int | None = None  # override eval.request_timeout for this eval
 
     # monitor_qa-specific (ignored for other datasets)
     path: str | None = None
@@ -223,6 +240,20 @@ class EvalConfig:
     temperature: float = 1.0
     request_timeout: int = 420
     seed: int = 42
+    # When True, only dispatch evals for the ``final`` checkpoint and skip
+    # any intermediate saves (e.g. step 500 / step 1000). Saved checkpoints
+    # stay on disk — this only gates the dispatcher.
+    only_final_checkpoint: bool = True
+    # Optional whitelist of checkpoint names the dispatcher will evaluate
+    # (everything else is skipped). Pair with ``save_at`` — saving a ckpt
+    # and dispatching an eval are independent. Example: ["000050",
+    # "000100", "000300", "final"] keeps 25/200/400 saved but unevaluated.
+    allowed_checkpoints: list[str] | None = None
+    # Priority order (high → low) for checkpoint dispatch. When multiple
+    # checkpoints are simultaneously available, the dispatcher prefers
+    # earlier-listed names. Names not in the list dispatch last. Soft hint
+    # — does not block lower-priority ckpts indefinitely.
+    checkpoint_priority: list[str] | None = None
 
 
 @dataclass
@@ -318,11 +349,42 @@ class LaunchConfig:
 
 
 def _compute_save_every(cfg: LaunchConfig, n_rows: int) -> int:
+    if cfg.training.save_at:
+        # GCD of the requested steps — gives Tinker an offer at each one.
+        from functools import reduce
+        return reduce(math.gcd, cfg.training.save_at)
     if cfg.training.save_every is not None:
         return cfg.training.save_every
     total_steps = (n_rows // cfg.training.batch_size) * cfg.training.num_epochs
     total_steps = max(total_steps, 1)
     return max(1, math.floor(total_steps * cfg.training.save_fraction))
+
+
+def _install_save_at_filter(allowed_steps: set[int]) -> None:
+    """Wrap tinker_cookbook's checkpoint saver so periodic saves only land
+    at steps in `allowed_steps`. The `final` save uses ``name="final"``
+    (not a zero-padded step number) and is always allowed.
+    """
+    import tinker_cookbook.checkpoint_utils as cu
+    original = cu.save_checkpoint_async
+
+    async def _filtered_save(*args, **kwargs):
+        name = kwargs.get("name", "")
+        # Periodic saves are named with zero-padded step (e.g. "000050").
+        if name.isdigit():
+            try:
+                step = int(name)
+            except ValueError:
+                return await original(*args, **kwargs)
+            if step not in allowed_steps:
+                logging.info(
+                    "[save_at filter] skipping checkpoint at step %d "
+                    "(not in allowed set %s)", step, sorted(allowed_steps),
+                )
+                return None
+        return await original(*args, **kwargs)
+
+    cu.save_checkpoint_async = _filtered_save
 
 
 def run_single_ft(short_name: str, cfg: LaunchConfig) -> None:
@@ -337,11 +399,16 @@ def run_single_ft(short_name: str, cfg: LaunchConfig) -> None:
     # Count rows for save_every calculation
     n_rows = len(pd.read_parquet(parquet_path))
     save_every = _compute_save_every(cfg, n_rows)
+    save_at = cfg.training.save_at
 
     logging.info("=" * 60)
     logging.info("TRAINING: %s  lora=%d  lr=%s  rows=%d  save_every=%d",
                  spec.model, cfg.training.lora_rank, cfg.training.learning_rate,
                  n_rows, save_every)
+    if save_at:
+        logging.info("  save_at: %s (intermediate ckpts; 'final' always saved)",
+                     sorted(save_at))
+        _install_save_at_filter(set(save_at))
     logging.info("  parquet: %s", parquet_path)
     logging.info("  log_path: %s", log_path)
     logging.info("=" * 60)
@@ -391,16 +458,23 @@ def _resolve_modes(modes_str: str, dataset: str) -> list[str]:
 def run_single_eval(
     short_name: str, ds_key: str, checkpoint_name: str, cfg: LaunchConfig,
 ) -> None:
-    """Child-process entrypoint: eval one checkpoint on one dataset (keyed by ds.key)."""
+    """Child-process entrypoint: eval one checkpoint on one dataset.
+
+    Special case: ``checkpoint_name == "base"`` runs against the model's base
+    weights (no FT, no sampler_path) — useful for pre-FT baselines.
+    """
     spec = cfg.get_model(short_name)
-    log_path = cfg.log_path_for(spec)
-    checkpoints = load_checkpoints_jsonl(log_path)
-    match = [c for c in checkpoints if c["name"] == checkpoint_name]
-    if not match:
-        logging.error("Checkpoint %s not found in %s", checkpoint_name, log_path)
-        return
-    ckpt = match[0]
-    sampler_path = ckpt["sampler_path"]
+    if checkpoint_name == "base":
+        sampler_path = None
+    else:
+        log_path = cfg.log_path_for(spec)
+        checkpoints = load_checkpoints_jsonl(log_path)
+        match = [c for c in checkpoints if c["name"] == checkpoint_name]
+        if not match:
+            logging.error("Checkpoint %s not found in %s", checkpoint_name, log_path)
+            return
+        ckpt = match[0]
+        sampler_path = ckpt["sampler_path"]
 
     eval_cfg = next((d for d in cfg.eval.datasets if d.key == ds_key), None)
     if eval_cfg is None:
@@ -419,6 +493,9 @@ def _run_standard_eval(
 ) -> None:
     dataset = eval_cfg.dataset
     modes = _resolve_modes(eval_cfg.modes, dataset)
+    if eval_cfg.exclude_modes:
+        excluded = set(eval_cfg.exclude_modes)
+        modes = [m for m in modes if m not in excluded]
     model_label = f"{spec.model}-ft-{cfg.run_id}-{checkpoint_name}"
     use_ac = ("gpt-oss" in spec.model and dataset == "reasonif")
 
@@ -431,6 +508,7 @@ def _run_standard_eval(
         seed=cfg.eval.seed,
         backend="tinker",
         max_concurrency=eval_cfg.max_concurrency or cfg.eval.max_concurrency,
+        request_timeout=eval_cfg.request_timeout or cfg.eval.request_timeout,
         max_retries=cfg.eval.max_retries,
         max_tokens=cfg.eval.max_tokens,
         temperature=cfg.eval.temperature,
@@ -438,7 +516,6 @@ def _run_standard_eval(
         n_samples=eval_cfg.n_samples,
         model_path=sampler_path,
         reasoning_effort=spec.reasoning_effort,
-        request_timeout=cfg.eval.request_timeout,
         analysis_channel=use_ac,
     )
     model_short = model_label.replace("/", "_")
@@ -489,7 +566,7 @@ def _run_monitor_qa_eval(
         monitor_reasoning_effort_overrides=eval_cfg.monitor_reasoning_effort_overrides or {},
         modes=modes,
         reasoning_effort=spec.reasoning_effort,
-        request_timeout=cfg.eval.request_timeout,
+        request_timeout=eval_cfg.request_timeout or cfg.eval.request_timeout,
         model_path=sampler_path,
         output_dir=str(RESULTS_DIR / "rollouts" / "monitor_qa"),
     )
@@ -590,10 +667,24 @@ async def orchestrate(
                          short_name, ds_key, ckpt_name, status)
             return status
 
+    def _ckpt_priority_key(name: str) -> tuple[int, str]:
+        prio = cfg.eval.checkpoint_priority or []
+        if name in prio:
+            return (prio.index(name), name)
+        return (len(prio), name)  # everything else after the listed ones
+
     def queue_evals_for(spec: FTModelSpec) -> None:
         """Inspect this model's checkpoints.jsonl and queue any unqueued evals."""
         log_path = cfg.log_path_for(spec)
         ckpts = load_checkpoints_jsonl(log_path)
+        if cfg.eval.only_final_checkpoint:
+            ckpts = [c for c in ckpts if c.get("name") == "final"]
+        # Filter to allowed checkpoints (when set) and sort by priority so
+        # higher-priority ckpts are queued (and therefore dispatched) first.
+        allowed = set(cfg.eval.allowed_checkpoints or [])
+        if allowed:
+            ckpts = [c for c in ckpts if c.get("name") in allowed]
+        ckpts.sort(key=lambda c: _ckpt_priority_key(c.get("name", "")))
         for ckpt in ckpts:
             ckpt_name = ckpt["name"]
             for ds in cfg.eval.datasets:
@@ -701,7 +792,9 @@ def _print_dry_run(cfg: LaunchConfig) -> None:
     print("\nTraining:")
     print(f"  batch_size={t.batch_size}  max_length={t.max_length}  epochs={t.num_epochs}")
     print(f"  lora_rank={t.lora_rank}  lr={t.learning_rate}")
-    if t.save_every is not None:
+    if t.save_at:
+        print(f"  save_at={sorted(t.save_at)} (explicit irregular schedule)")
+    elif t.save_every is not None:
         print(f"  save_every={t.save_every} (explicit)")
     else:
         print(f"  save_fraction={t.save_fraction} (auto save_every per model)")
@@ -710,6 +803,10 @@ def _print_dry_run(cfg: LaunchConfig) -> None:
     print("\nEval:")
     print(f"  max_eval_workers={e.max_eval_workers}  max_concurrency={e.max_concurrency}")
     print(f"  max_tokens={e.max_tokens}  request_timeout={e.request_timeout}")
+    if e.allowed_checkpoints:
+        print(f"  allowed_checkpoints={e.allowed_checkpoints}")
+    if e.checkpoint_priority:
+        print(f"  checkpoint_priority={e.checkpoint_priority}")
     for ds in e.datasets:
         if ds.dataset == "monitor_qa":
             print(f"  - monitor_qa[{ds.label}]  prompt={ds.prompt_type}  modes={ds.modes}"
@@ -723,11 +820,20 @@ def _print_dry_run(cfg: LaunchConfig) -> None:
     # Estimate checkpoint count per FT based on save_every and a typical
     # parquet size. Reads the first model's parquet if it exists.
     n_ckpts = _estimate_checkpoint_count(cfg)
+    if cfg.eval.only_final_checkpoint:
+        n_eval_ckpts = 1
+    elif cfg.eval.allowed_checkpoints:
+        n_eval_ckpts = len(cfg.eval.allowed_checkpoints)
+    else:
+        n_eval_ckpts = n_ckpts
     print(f"\n  Total eval jobs per checkpoint: {len(e.datasets)}")
+    print(f"  only_final_checkpoint: {cfg.eval.only_final_checkpoint}")
     if n_ckpts:
-        print(f"  Expected jobs per FT (~{n_ckpts} checkpoints): {len(e.datasets) * n_ckpts}")
+        print(f"  Saved checkpoints per FT: ~{n_ckpts}  (evaluated: "
+              f"{n_eval_ckpts})")
+        print(f"  Expected jobs per FT: {len(e.datasets) * n_eval_ckpts}")
         print(f"  Total across {len(cfg.models)} models: "
-              f"{len(e.datasets) * n_ckpts * len(cfg.models)}")
+              f"{len(e.datasets) * n_eval_ckpts * len(cfg.models)}")
     else:
         print("  Expected checkpoints per FT: depends on parquet size "
               "(not yet built).")
@@ -742,6 +848,11 @@ def main() -> None:
     parser.add_argument("--models", default=None,
                         help="Comma-separated short names to restrict to")
     parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--ft-only", action="store_true",
+                        help="Run FTs only, no eval dispatch.")
+    parser.add_argument("--datasets-filter", default=None,
+                        help="Comma-separated list of dataset keys (`<dataset>` "
+                             "or `<dataset>@<label>`) to retain. Filters out the rest.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-interval", type=float, default=10.0)
 
@@ -758,6 +869,23 @@ def main() -> None:
 
     config_path = args.config.resolve()
     cfg = LaunchConfig.from_yaml(config_path, override_run_id=args.run_id)
+
+    # Apply CLI dataset filter (used to phase evals across runs)
+    if args.datasets_filter:
+        wanted = {s.strip() for s in args.datasets_filter.split(",") if s.strip()}
+        before = len(cfg.eval.datasets)
+        cfg.eval.datasets = [d for d in cfg.eval.datasets if d.key in wanted]
+        if not cfg.eval.datasets:
+            parser.error(
+                f"--datasets-filter {sorted(wanted)} matched no datasets. "
+                f"Available keys: {[d.key for d in cfg.eval.datasets]}"
+            )
+        logging.info("--datasets-filter: kept %d/%d datasets (%s)",
+                     len(cfg.eval.datasets), before,
+                     [d.key for d in cfg.eval.datasets])
+
+    if args.ft_only:
+        cfg.eval.datasets = []
 
     # --- single-ft subprocess mode ---
     if args.single_ft:

@@ -72,6 +72,86 @@ def _create_client(config: ExperimentConfig, settings: Settings) -> InferenceCli
         raise ValueError(f"Unknown backend: {config.backend}")
 
 
+def _classify_thinking(
+    reasoning: str | None,
+    content: str | None,
+    raw_text: str | None = None,
+) -> str:
+    """Classify a rollout's reasoning structure.
+
+    When ``raw_text`` is provided (full assistant turn including any prefill),
+    we substring-check for `<think>` / `</think>` presence and ordering —
+    the principled distinction between malformed and well-formed.
+
+    Returns one of:
+      "ok"                  — well-formed: `<think>...</think>{answer}` in
+                              the right order, with non-empty answer.
+      "empty_well_formed"   — `<think></think>{answer}` (clean empty think
+                              with non-empty answer; still evaluable).
+      "malformed_no_open"   — has `</think>` but no `<think>`.
+      "malformed_no_close"  — has `<think>` but no `</think>`.
+      "malformed_no_markers" — has neither `<think>` nor `</think>`.
+      "malformed_wrong_order" — `</think>` appears before `<think>`.
+      "malformed_no_answer" — well-formed `<think>...</think>` but nothing
+                              (non-whitespace) after the close tag.
+
+    Fallback when ``raw_text`` is unavailable: use the legacy length
+    heuristic (empty reasoning + long content → malformed_no_markers).
+    """
+    if raw_text is None or not raw_text:
+        # Legacy fallback for callers that haven't been updated to pass raw_text.
+        r = (reasoning or "").strip()
+        c = (content or "").strip()
+        if not c:
+            return "malformed_no_answer"
+        if not r and len(c) > 200:
+            return "malformed_no_markers"
+        if not r:
+            return "empty_well_formed"
+        return "ok"
+
+    has_open = "<think>" in raw_text
+    has_close = "</think>" in raw_text
+
+    if not has_open and not has_close:
+        return "malformed_no_markers"
+    if has_open and not has_close:
+        return "malformed_no_close"
+    if has_close and not has_open:
+        return "malformed_no_open"
+
+    open_idx = raw_text.index("<think>")
+    close_idx = raw_text.index("</think>")
+    if close_idx < open_idx:
+        return "malformed_wrong_order"
+
+    after_close = raw_text[close_idx + len("</think>"):].strip()
+    if not after_close:
+        return "malformed_no_answer"
+
+    inside = raw_text[open_idx + len("<think>"): close_idx].strip()
+    if not inside:
+        return "empty_well_formed"
+    return "ok"
+
+
+def _think_prefill_for_model(model: str) -> str | None:
+    """Return the right `<think>` prefill for the actor.
+
+    Returns None for every family because manual prefill is unnecessary:
+
+    - gpt-oss: uses analysis channel, no `<think>` tag.
+    - qwen3: model self-emits `<think>\\n` after the assistant header (its
+      training format). Adding manual `<think>` causes a double-prefix
+      (``<think><think>\\n...``).
+    - deepseek/kimi/nemotron: renderer auto-prefills `<think>` (or
+      `<think>\\n` for nemotron) inside ``build_generation_prompt``;
+      manual prefill would either double up (deepseek) or replace it
+      (kimi).
+    """
+    return None
+
+
 def _build_prompts(
     mode_name: str,
     sample: Sample,
@@ -191,6 +271,7 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
                     model=config.model,
                     max_tokens=config.max_tokens,
                     temperature=config.temperature,
+                    prefill=_think_prefill_for_model(config.model),
                 )
                 work_items.append((mode_name, sample, sys_prompt, usr_prompt, request))
 
@@ -225,6 +306,16 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
                 extracted = extract_answer(resp.content, sample.options)
                 correct = grade_correctness(extracted, sample.correct_answer, sample.options)
 
+                # Classify the response based on its raw `<think>` / `</think>`
+                # structure so downstream consumers can distinguish a clean
+                # empty `<think></think>` (model answered without reasoning)
+                # from a malformed output (no markers, never closed, etc.).
+                # cotcontrol/reasonif scoring is unchanged — the empty-reasoning
+                # branch is still ungradable; only the error label is specific.
+                thinking_kind = _classify_thinking(
+                    resp.reasoning, resp.content, getattr(resp, "raw_text", "") or "",
+                )
+
                 if resp.error:
                     grading_result = {"error": resp.error}
                     compliant = None
@@ -232,7 +323,10 @@ async def run_experiment(config: ExperimentConfig) -> list[Rollout]:
                     grading_result = {"compliant": False, "mode": "ignore_question", "note": "no_reasoning"}
                     compliant = False
                 elif not resp.reasoning:
-                    grading_result = {"error": "no_reasoning_trace"}
+                    if thinking_kind == "empty_well_formed":
+                        grading_result = {"error": "empty_thinking_well_formed"}
+                    else:
+                        grading_result = {"error": f"malformed_think:{thinking_kind.replace('malformed_', '')}"}
                     compliant = None
                 elif mode_name == "ignore_question":
                     # Defer to async batch below
@@ -432,6 +526,10 @@ async def _run_monitor_streaming(
         messages.append({"role": "user", "content": usr_prompt})
 
         prefill = actor_prompt_builder.build_actor_prefill(mode)
+        if prefill is None:
+            # Fall back to a model-aware `<think>` prefill so the actor
+            # always opens its reasoning channel consistently.
+            prefill = _think_prefill_for_model(config.actor_model)
 
         actor_request = InferenceRequest(
             messages=messages,
@@ -592,6 +690,16 @@ async def _run_monitor_streaming(
             dataset_split=config.dataset_split,
             actor_error=actor_resp.error,
             monitor_error=first.monitor_error if first else None,
+            # Reasoning-trace classification — distinguishes empty-but-
+            # well-formed (`<think></think>` + answer, still evaluable)
+            # from malformed (no `<think>` markers, or no answer at all).
+            # Doesn't change side_task_correct / monitor scores; analysis
+            # scripts can filter on this field.
+            actor_thinking_kind=_classify_thinking(
+                actor_resp.reasoning,
+                actor_resp.content,
+                getattr(actor_resp, "raw_text", "") or "",
+            ),
         )
 
         # --- Buffer & flush ---

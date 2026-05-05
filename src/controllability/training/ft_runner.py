@@ -19,13 +19,10 @@ from pathlib import Path
 import chz
 import pandas as pd
 import tinker
-from tinker_cookbook.renderers import (
-    GptOssRenderer,
-    Message,
-    Qwen3Renderer,
-    TrainOnWhat,
-)
-from tinker_cookbook.supervised.common import datum_from_tokens_weights
+from tinker_cookbook import renderers
+from tinker_cookbook.renderers import Message, TrainOnWhat
+from tinker_cookbook.renderers.qwen3 import Qwen3Renderer
+from tinker_cookbook.supervised.common import datum_from_model_input_weights
 from tinker_cookbook.supervised.types import SupervisedDataset, SupervisedDatasetBuilder
 
 
@@ -56,45 +53,47 @@ class FTModelSpec:
 # ---------------------------------------------------------------------------
 
 
-class Qwen3CoTRenderer(Qwen3Renderer):
-    """Qwen3Renderer extended to handle the 'thinking' field for CoT SFT."""
+def _to_structured_parts(role: str, content: str, thinking: str) -> list[dict] | str:
+    """Convert old-format ``{content, thinking}`` into the structured content
+    parts that the v0.3.0 renderers (Qwen3, gpt-oss, DeepSeek, Kimi,
+    Nemotron) expect.
 
-    def _render_message(
-        self, idx: int, message: Message
-    ) -> tuple[list[int], list[int], list[int]]:
-        maybe_newline = "\n" if idx > 0 else ""
-        ob_str = f"{maybe_newline}<|im_start|>{message['role']}\n"
-
-        thinking = message.get("thinking")
-        content = message.get("content", "") or ""
-
-        if message["role"] == "assistant" and thinking:
-            ac_content = f"<think>\n{thinking}\n</think>\n{content}"
-        elif message["role"] == "assistant" and "<think>" not in content:
-            ob_str += "<think>\n"
-            ac_content = content
-        else:
-            ac_content = content
-
-        ac_content += "<|im_end|>"
-
-        return (
-            self.tokenizer.encode(ob_str, add_special_tokens=False),
-            self.tokenizer.encode(ac_content, add_special_tokens=False),
-            self.tokenizer.encode("", add_special_tokens=False),
-        )
+    Assistant messages with thinking → ``[ThinkingPart, TextPart]`` list.
+    Everything else stays as a plain string.
+    """
+    if role == "assistant" and thinking:
+        return [
+            {"type": "thinking", "thinking": thinking},
+            {"type": "text",     "text":     content},
+        ]
+    return content
 
 
 def make_renderer(spec: FTModelSpec, tokenizer):
-    if spec.renderer_type == "gpt-oss":
+    """Build a tinker-cookbook renderer for this model family.
+
+    Uses direct class instantiation for gpt-oss (needs reasoning_effort kwarg)
+    and qwen3 (we have a thinking-aware subclass). Every other family goes
+    through the ``renderers.get_renderer()`` factory.
+    """
+    rt = spec.renderer_type
+    if rt == "gpt-oss":
+        from tinker_cookbook.renderers.gpt_oss import GptOssRenderer
         return GptOssRenderer(
             tokenizer=tokenizer,
             use_system_prompt=True,
             reasoning_effort=spec.reasoning_effort,
         )
-    if spec.renderer_type == "qwen3":
-        return Qwen3CoTRenderer(tokenizer=tokenizer)
-    raise ValueError(f"Unknown renderer_type: {spec.renderer_type}")
+    if rt == "qwen3":
+        # Stock Qwen3Renderer handles thinking via structured content parts.
+        return Qwen3Renderer(tokenizer=tokenizer)
+    if rt == "deepseek-v3.1":
+        return renderers.get_renderer("deepseekv3_thinking", tokenizer)
+    if rt == "kimi-k2.5":
+        return renderers.get_renderer("kimi_k25", tokenizer)
+    if rt == "nemotron-3":
+        return renderers.get_renderer("nemotron3", tokenizer)
+    raise ValueError(f"Unknown renderer_type: {rt}")
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +128,13 @@ class SFTDataset(SupervisedDataset):
         for _, row in df.iterrows():
             messages = []
             for msg in row["messages"]:
-                m = {"role": msg["role"], "content": msg.get("content", "") or ""}
-                if msg.get("thinking"):
-                    m["thinking"] = msg["thinking"]
-                messages.append(m)
+                role = msg["role"]
+                content = msg.get("content", "") or ""
+                thinking = msg.get("thinking", "") or ""
+                messages.append({
+                    "role": role,
+                    "content": _to_structured_parts(role, content, thinking),
+                })
             self._conversations.append(messages)
 
         self._batch_size = batch_size
@@ -152,10 +154,14 @@ class SFTDataset(SupervisedDataset):
         data = []
         for idx in batch_indices:
             conv = self._conversations[idx]
-            tokens, weights = self._renderer.build_supervised_example(
-                conv, train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES
+            # Each conversation is single-turn (one user → one assistant) so
+            # LAST_ASSISTANT_MESSAGE has the same effect as the old
+            # ALL_ASSISTANT_MESSAGES but avoids the v0.3.0 warning about
+            # renderers without the extension property.
+            model_input, weights = self._renderer.build_supervised_example(
+                conv, train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE
             )
-            datum = datum_from_tokens_weights(tokens, weights, self._max_length)
+            datum = datum_from_model_input_weights(model_input, weights, self._max_length)
             data.append(datum)
         return data
 
@@ -200,7 +206,8 @@ class ParquetDatasetBuilder(SupervisedDatasetBuilder):
         from transformers import AutoTokenizer
 
         cfg = get_active_builder_config()
-        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
+        trc = cfg.base_model.lower().startswith("moonshotai/")
+        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=trc)
         spec_like = FTModelSpec(
             model=cfg.base_model,
             base_model=cfg.base_model,

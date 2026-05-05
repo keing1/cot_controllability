@@ -38,6 +38,9 @@ class InferenceResponse(BaseModel):
 
     content: str  # Final response text
     reasoning: str = ""  # CoT trace (from reasoning_content or <think> tags)
+    raw_text: str = ""   # Pre-parse decoded text including prefill (for
+                         # malformed-think detection: substring-checks for
+                         # `<think>` / `</think>` presence and ordering)
     latency_ms: float = 0.0
     usage: dict[str, int] = {}
     error: str | None = None
@@ -133,3 +136,12 @@ class MonitorRollout(BaseModel):
     # Errors
     actor_error: str | None = None
     monitor_error: str | None = None
+
+    # Actor reasoning-trace classification:
+    #   "ok"                 — non-empty `<think>...</think>` reasoning
+    #   "empty_well_formed"  — model emitted a clean empty `<think></think>`
+    #                          and provided an answer (still evaluable)
+    #   "malformed_no_markers" — no `<think>` markers at all (parser put
+    #                          reasoning prose into content)
+    #   "malformed_no_answer" — `<think>...</think>` but no answer after
+    actor_thinking_kind: str = "ok"

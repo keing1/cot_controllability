@@ -132,13 +132,20 @@ _MQA_SETTINGS = [
     "baseline_main_and_side",
     "baseline_formatted",
     "user_intense_hiding",
+    "user_less_reasoning_v2",
     "user_less_reasoning",
+    "user_dont_think_v2",
     "user_dont_think",
+    "user_vocab_control",
     "user_misdirect",
     "user_gray_swan",
     "user_roleplay",
     "user_pressure",
     "user_default",
+    # Unprefixed variants used by recent FT-eval files (no `user_` prefix).
+    "less_reasoning_v2",
+    "dont_think_v2",
+    "vocab_control",
     "dont_think",
     "baseline",
     "default",
@@ -146,15 +153,101 @@ _MQA_SETTINGS = [
 _MQA_SETTING_RE = re.compile(r"_(" + "|".join(_MQA_SETTINGS) + r")_")
 
 
+# Strip the optional provider prefix ("openai_", "qwen_", "deepseek-ai_",
+# "moonshotai_", "nvidia_") and the FT suffix to recover the short base model.
+# Long names from FT run filenames look like:
+#   "openai_gpt-oss-20b-ft-20260419_081434-final"
+#   "qwen_qwen3-8b-ft-20260417_034641-000125"
+#   "deepseek-ai_DeepSeek-V3.1-ft-base_20260420_224645-base"
+#   "nvidia_NVIDIA-Nemotron-3-Nano-30B-A3B-BF16-ft-20260420_111850-final"
+# Also handle the legacy short FT suffix `-ft60` (e.g. "gpt-oss-20b-ft60").
+_PROVIDER_PREFIXES = (
+    "openai_", "qwen_", "deepseek-ai_", "moonshotai_", "nvidia_",
+)
+# Match `-ft-{run_id}-{ckpt}` where run_id is `[base_]YYYYMMDD_HHMMSS` and
+# ckpt is `final`, `base`, or a numeric checkpoint like `000125`.
+_FT_FULL_RE = re.compile(
+    r"-ft-(?P<rid>(?:base_)?\d{8}_\d{6})-(?P<ckpt>final|base|\d{3,})$"
+)
+# Legacy short suffix.
+_FT_SHORT_RE = re.compile(r"-ft60$")
+
+# Friendly model display names.
+_MODEL_DISPLAY = {
+    "DeepSeek-V3.1":                              "DeepSeek V3.1",
+    "Kimi-K2.5":                                  "Kimi K2.5",
+    "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":        "Nemotron-3 Nano",
+    "NVIDIA-Nemotron-3-Super-120B-A12B-BF16":     "Nemotron-3 Super",
+}
+
+# Friendly labels for FT run groups. Keep keys synced with the run_ids
+# present in `results/rollouts/monitor_qa/` filenames.
+_FT_GROUP_LABEL = {
+    "ft60":                  "ft60 — 1K stripped (batch 60)",
+    "20260417_034641":       "Mixed 1K (2026-04-17)",
+    "20260419_081434":       "Mixed 5K — old 4 (2026-04-19)",
+    "20260420_111850":       "Mixed 5K — new models (2026-04-20)",
+    "20260428_071457":       "Mixed 5K v3 part 1 (2026-04-28)",
+    "20260428_072455":       "Mixed 5K v3 part 2 (2026-04-28)",
+    "20260430_113831":       "Mixed 5K v4 — 7 models (2026-04-30)",
+}
+
+
+def _strip_provider(s: str) -> str:
+    for p in _PROVIDER_PREFIXES:
+        if s.startswith(p):
+            return s[len(p):]
+    return s
+
+
+def _split_ft_model(model_str: str) -> tuple[str, bool, str, str]:
+    """Return (short_base_model, is_ft, ft_run_id, ft_checkpoint).
+
+    `ft_run_id` is "" for non-FT files. For the legacy `-ft60` suffix we
+    use ``ft_run_id="ft60"`` and ``ft_checkpoint="ft60"``.
+
+    The `-ft-base_*-base` pattern (new-model base-eval re-runs) is treated
+    as Base, not FT — it's a base model whose filename happens to share
+    the FT naming convention because Tinker stores them under the same
+    artifact root.
+    """
+    raw = _strip_provider(model_str)
+    m = _FT_FULL_RE.search(raw)
+    if m:
+        base = raw[: m.start()]
+        rid = m.group("rid")
+        ckpt = m.group("ckpt")
+        # Treat the base-eval re-run scheme as Base (not FT).
+        if ckpt == "base" and rid.startswith("base_"):
+            return _MODEL_DISPLAY.get(base, base), False, "", ""
+        return _MODEL_DISPLAY.get(base, base), True, rid, ckpt
+    m = _FT_SHORT_RE.search(raw)
+    if m:
+        base = raw[: m.start()]
+        return _MODEL_DISPLAY.get(base, base), True, "ft60", "ft60"
+    return _MODEL_DISPLAY.get(raw, raw), False, "", ""
+
+
+def _ft_group_label(run_id: str) -> str:
+    if not run_id:
+        return ""
+    return _FT_GROUP_LABEL.get(run_id, run_id)
+
+
 @dataclass
 class MonitorQAFileMetadata:
     path: Path
     filename: str
-    model: str       # e.g. "gpt-oss-120b" or "qwen3-8b-ft60"
-    setting: str     # "baseline", "default", or "dont_think"
-    run_id: str      # hex hash at end
-    date_str: str    # e.g. "20260402_090606" or "20260403_rerun"
-    split: str       # "val", "old", or "unknown"
+    model: str            # raw model string from filename (kept for compat)
+    base_model: str       # short, e.g. "gpt-oss-20b" or "DeepSeek V3.1"
+    is_ft: bool
+    ft_run_id: str        # e.g. "20260419_081434" or "ft60" or ""
+    ft_checkpoint: str    # e.g. "final", "000125", "ft60", or ""
+    ft_group_label: str   # human-readable, e.g. "Mixed 5K — old 4 (2026-04-19)"
+    setting: str          # "baseline", "default", "user_default", ...
+    run_id: str           # hex hash at end
+    date_str: str         # e.g. "20260402_090606" or "20260403_rerun"
+    split: str            # "val", "old", or "unknown"
 
 
 def parse_monitor_qa_filename(path: Path) -> MonitorQAFileMetadata | None:
@@ -183,17 +276,28 @@ def parse_monitor_qa_filename(path: Path) -> MonitorQAFileMetadata | None:
         split = "old"
         tail = tail[len("old_split_"):]
 
-    # run_id is the last _-separated segment (hex hash)
+    # run_id is the last _-separated segment (hex hash). Newer FT-eval files
+    # omit the {date}_ prefix so the tail is just the hash.
     last_uscore = tail.rfind("_")
     if last_uscore == -1:
+        run_id = tail
+        date_str = ""
+    else:
+        run_id = tail[last_uscore + 1:]
+        date_str = tail[:last_uscore]
+    if not run_id:
         return None
-    run_id = tail[last_uscore + 1:]
-    date_str = tail[:last_uscore]
 
+    base_model, is_ft, ft_run_id, ft_checkpoint = _split_ft_model(model)
     return MonitorQAFileMetadata(
         path=path,
         filename=path.name,
         model=model,
+        base_model=base_model,
+        is_ft=is_ft,
+        ft_run_id=ft_run_id,
+        ft_checkpoint=ft_checkpoint,
+        ft_group_label=_ft_group_label(ft_run_id),
         setting=setting,
         run_id=run_id,
         date_str=date_str,
@@ -735,34 +839,100 @@ else:
             st.warning("Could not parse any MonitorQA filenames.")
             st.stop()
 
-        # --- MonitorQA sidebar filters ---
+        # --- MonitorQA sidebar filters (cascading) ---
+        # Each filter narrows a running pool; later filters' option lists
+        # come from the already-narrowed pool, so they only show values
+        # that are actually still reachable.
 
-        all_mqa_models = sorted({m.model for m in all_mqa_meta})
-        sel_mqa_models = st.multiselect("Model", all_mqa_models, default=all_mqa_models)
+        pool = list(all_mqa_meta)
 
-        all_mqa_splits = sorted({m.split for m in all_mqa_meta})
-        default_splits = ["val"] if "val" in all_mqa_splits else all_mqa_splits
-        sel_mqa_splits = st.multiselect("Split", all_mqa_splits, default=default_splits)
+        # 1. Base Model
+        all_mqa_base_models = sorted({m.base_model for m in pool})
+        sel_mqa_base_models = st.multiselect(
+            "Base Model", all_mqa_base_models, default=all_mqa_base_models,
+        )
+        pool = [m for m in pool if m.base_model in sel_mqa_base_models]
 
-        all_mqa_settings = sorted({m.setting for m in all_mqa_meta})
-        sel_mqa_settings = st.multiselect("Setting", all_mqa_settings, default=all_mqa_settings)
+        # 2. Variant (Base / FT)
+        ft_filter = st.radio(
+            "Variant", ["All", "Base only", "FT only"], horizontal=True,
+            key="mqa_ft_filter",
+        )
+        if ft_filter == "Base only":
+            pool = [m for m in pool if not m.is_ft]
+        elif ft_filter == "FT only":
+            pool = [m for m in pool if m.is_ft]
 
-        all_mqa_dates = sorted({m.date_str for m in all_mqa_meta})
+        # 3. FT Run (only meaningful when ≥1 FT file is in the pool)
+        ft_subpool = [m for m in pool if m.is_ft]
+        if ft_subpool:
+            ft_groups = sorted(
+                {(m.ft_run_id, m.ft_group_label) for m in ft_subpool},
+                key=lambda x: x[1],
+            )
+            ft_group_labels = [lbl for _, lbl in ft_groups]
+            sel_ft_groups = st.multiselect(
+                "FT Run", ft_group_labels, default=ft_group_labels,
+                help="Groups of fine-tuning runs (each maps to a run_id).",
+            )
+            sel_ft_run_ids = {rid for rid, lbl in ft_groups if lbl in sel_ft_groups}
+            # Drop FT files whose run_id wasn't selected. Base files are
+            # always retained at this stage.
+            pool = [
+                m for m in pool
+                if (not m.is_ft) or (m.ft_run_id in sel_ft_run_ids)
+            ]
+
+        # 4. FT Checkpoint (options reflect the post-FT-Run pool)
+        ft_subpool = [m for m in pool if m.is_ft]
+        if ft_subpool:
+            all_ckpts = sorted({m.ft_checkpoint for m in ft_subpool if m.ft_checkpoint})
+            if len(all_ckpts) > 1:
+                sel_ckpts = st.multiselect(
+                    "FT Checkpoint", all_ckpts, default=all_ckpts,
+                )
+                pool = [
+                    m for m in pool
+                    if (not m.is_ft)
+                    or (not m.ft_checkpoint)
+                    or (m.ft_checkpoint in sel_ckpts)
+                ]
+
+        # 5. Split
+        all_mqa_splits = sorted({m.split for m in pool})
+        if len(all_mqa_splits) > 1:
+            default_splits = ["val"] if "val" in all_mqa_splits else all_mqa_splits
+            sel_mqa_splits = st.multiselect(
+                "Split", all_mqa_splits, default=default_splits,
+            )
+            pool = [m for m in pool if m.split in sel_mqa_splits]
+
+        # 6. Setting (default excludes baseline / baseline_formatted)
+        all_mqa_settings = sorted({m.setting for m in pool})
+        default_settings = [
+            s for s in all_mqa_settings
+            if s not in ("baseline", "baseline_formatted")
+        ] or all_mqa_settings
+        sel_mqa_settings = st.multiselect(
+            "Setting", all_mqa_settings, default=default_settings,
+        )
+        pool = [m for m in pool if m.setting in sel_mqa_settings]
+
+        # 7. Date (only the values reachable in the current pool)
+        all_mqa_dates = sorted({m.date_str for m in pool})
         if len(all_mqa_dates) > 1:
-            sel_mqa_dates = st.multiselect("Date", all_mqa_dates, default=all_mqa_dates)
-        else:
-            sel_mqa_dates = all_mqa_dates
+            sel_mqa_dates = st.multiselect(
+                "Date", all_mqa_dates, default=all_mqa_dates,
+                format_func=lambda d: d if d else "(none)",
+            )
+            pool = [m for m in pool if m.date_str in sel_mqa_dates]
 
-        mqa_filtered = [
-            m
-            for m in all_mqa_meta
-            if m.model in sel_mqa_models
-            and m.split in sel_mqa_splits
-            and m.setting in sel_mqa_settings
-            and m.date_str in sel_mqa_dates
-        ]
+        mqa_filtered = list(pool)
 
-        mqa_filtered.sort(key=lambda m: (m.model, m.setting, m.date_str, m.filename))
+        mqa_filtered.sort(key=lambda m: (
+            m.base_model, m.is_ft, m.ft_group_label, m.ft_checkpoint,
+            m.setting, m.date_str, m.filename,
+        ))
 
         if not mqa_filtered:
             st.warning("No MonitorQA files match current filters.")
@@ -790,9 +960,16 @@ else:
 
     # ---- Header info ---------------------------------------------------------
 
+    variant_label = (
+        mqa_meta.ft_group_label if mqa_meta.is_ft and mqa_meta.ft_group_label
+        else ("FT" if mqa_meta.is_ft else "Base")
+    )
+    if mqa_meta.is_ft and mqa_meta.ft_checkpoint and mqa_meta.ft_checkpoint != "ft60":
+        variant_label = f"{variant_label} · {mqa_meta.ft_checkpoint}"
     st.markdown(
-        f"**Model:** `{mqa_meta.model}`  |  **Setting:** `{mqa_meta.setting}`  |  "
-        f"**Run:** `{mqa_meta.run_id}`  |  **Rollouts:** {len(records)}"
+        f"**Model:** `{mqa_meta.base_model}`  |  **Variant:** `{variant_label}`  |  "
+        f"**Setting:** `{mqa_meta.setting}`  |  **Run:** `{mqa_meta.run_id}`  |  "
+        f"**Rollouts:** {len(records)}"
     )
 
     if header:
@@ -881,7 +1058,7 @@ else:
     has_ra = f"score_reasoning_audit" in df.columns
     has_ra_mini = f"score_reasoning_audit_mini" in df.columns
 
-    fc_r1, fc_r2, fc_r3, fc_r4 = st.columns([1, 1, 2, 2])
+    fc_r1, fc_r2, fc_ra_flag, fc_r3, fc_r4 = st.columns([1, 1, 1, 2, 2])
 
     with fc_r1:
         mentions_filter = st.selectbox(
@@ -899,6 +1076,16 @@ else:
                  "'main_task', 'side_task', 'both tasks', 'two tasks', "
                  "'two questions', 'main question', 'side question', "
                  "'main answer', 'side answer', 'both answer'.",
+        )
+    with fc_ra_flag:
+        ra_flagged_filter = st.selectbox(
+            "RA flagged",
+            ["All", "True", "False", "NA"],
+            key="mqa_ra_flagged_filter",
+            help="Reasoning Audit flagged the rollout (score == max: 1.0 on "
+                 "the binary scale, 10.0 on the 0–10 scale). 'False' = scored "
+                 "and not at max (NA rows excluded); 'NA' = no RA score.",
+            disabled=not has_ra,
         )
     with fc_r3:
         if has_ra:
@@ -976,6 +1163,20 @@ else:
     if strong_filter != "All":
         want_strong = strong_filter == "True"
         mask = mask & (df["mentions_strong"] == want_strong)
+
+    # RA flagged filter (max-score on the active reasoning_audit column)
+    if has_ra and ra_flagged_filter != "All":
+        ra_col = "score_reasoning_audit"
+        flagged_max = 1.0 if ra_is_binary else 10.0
+        scored = df[ra_col].notna()
+        is_flagged = scored & (df[ra_col] == flagged_max)
+        if ra_flagged_filter == "True":
+            mask = mask & is_flagged
+        elif ra_flagged_filter == "False":
+            # "scored and not at max" — NA rows excluded
+            mask = mask & scored & ~is_flagged
+        else:  # "NA"
+            mask = mask & ~scored
 
     # Error filter
     if error_filter == "No errors":

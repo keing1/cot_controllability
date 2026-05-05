@@ -41,13 +41,17 @@ CNAME_TO_SHORT = {
     "cotcontrol:ignore_question": "ignore_question",
 }
 
-# Model name from filename: e.g. "gpt-oss-20b-reasonif-sft.parquet" -> "GPT-OSS-20B".
-# Accepts any composition tag (reasonif / cotcontrol / mixed) and optional
-# suffixes like "-stripped", "-stripped-ac".
-_COMPOSITION_RE = r"(?:reasonif|cotcontrol|mixed[0-9a-z]*)"
-_MODEL_RE = re.compile(rf"^(.+?)-{_COMPOSITION_RE}-sft(?:-[a-z]+)*\.parquet$")
-_VARIANT_RE = re.compile(rf"-{_COMPOSITION_RE}-sft((?:-[a-z]+)*)\.parquet$")
-_COMPOSITION_EXTRACT_RE = re.compile(rf"-({_COMPOSITION_RE})-sft(?:-[a-z]+)*\.parquet$")
+# Model name from filename:
+#   v1-v3 (with -sft):   "gpt-oss-20b-reasonif-sft.parquet"
+#                        "gpt-oss-20b-mixed5k-sft-stripped-ac.parquet"
+#   v4+   (no -sft):     "gpt-oss-20b-mixed5k-v4-stripped-ac.parquet"
+# Composition can carry a -v<N> suffix (e.g. "mixed5k-v4"). The "-sft"
+# infix is optional. Trailing variant tags ("-stripped", "-ac") are matched
+# by the variant suffix.
+_COMPOSITION_RE = r"(?:reasonif|cotcontrol|mixed[0-9a-z]*(?:-v\d+)?)"
+_MODEL_RE = re.compile(rf"^(.+?)-{_COMPOSITION_RE}(?:-sft)?(?:-[a-z]+)*\.parquet$")
+_VARIANT_RE = re.compile(rf"-{_COMPOSITION_RE}(?:-sft)?((?:-[a-z]+)*)\.parquet$")
+_COMPOSITION_EXTRACT_RE = re.compile(rf"-({_COMPOSITION_RE})(?:-sft)?(?:-[a-z]+)*\.parquet$")
 
 
 def _parse_composition(filename: str) -> str:
@@ -241,14 +245,59 @@ df["instruction_type"] = df["constraint_name"].apply(
     lambda x: CNAME_TO_SHORT.get(_get_val(x), _get_val(x))
 )
 
+
+def _short_source(constraint: str) -> str:
+    """Map a constraint short-name to its source family (cotcontrol/reasonif)."""
+    if constraint in {
+        "word_suppression", "multiple_word_suppression", "uppercase_thinking",
+        "lowercase_thinking", "alternating_case", "end_of_sentence",
+        "meow_between_words", "repeat_sentences", "ignore_question",
+    }:
+        return "cotcontrol"
+    return "reasonif"
+
+
+df["source_short"] = df["instruction_type"].apply(_short_source)
+
 # ---- Sidebar: instruction filter -----------------------------------------
 
 with st.sidebar:
     st.header("Filters")
-    all_types = sorted(df["instruction_type"].unique())
-    sel_types = st.multiselect("Instruction Type", all_types, default=all_types)
+
+    # Source family filter (cotcontrol vs reasonif vs all)
+    source_choice = st.radio(
+        "Source", ["All", "CoTControl", "ReasonIF"], horizontal=True,
+    )
+
+    # Compliance filter
+    compliant_choice = st.radio(
+        "Compliance", ["All", "Compliant only", "Non-compliant only"],
+        horizontal=True,
+    )
+
+    # Instruction-type multiselect — narrowed by source choice
+    pool = df
+    if source_choice == "CoTControl":
+        pool = pool[pool["source_short"] == "cotcontrol"]
+    elif source_choice == "ReasonIF":
+        pool = pool[pool["source_short"] == "reasonif"]
+    all_types = sorted(pool["instruction_type"].unique())
+    sel_types = st.multiselect(
+        "Instruction Type / Mode", all_types, default=all_types,
+        help="Pick one or more modes (uppercase_thinking, repeat_sentences, "
+             "json_format, etc.). Narrowed automatically by Source above.",
+    )
 
 mask = df["instruction_type"].isin(sel_types)
+if source_choice == "CoTControl":
+    mask = mask & (df["source_short"] == "cotcontrol")
+elif source_choice == "ReasonIF":
+    mask = mask & (df["source_short"] == "reasonif")
+if compliant_choice == "Compliant only":
+    mask = mask & (df["compliant"] == True)  # noqa: E712
+elif compliant_choice == "Non-compliant only":
+    mask = mask & (df["compliant"] == False)  # noqa: E712
+
 filtered = df[mask].reset_index(drop=True)
 
 # ---- Metrics -------------------------------------------------------------

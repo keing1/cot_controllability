@@ -219,7 +219,7 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--request-timeout", type=int, default=300)
-    parser.add_argument("--max-concurrency", type=int, default=30)
+    parser.add_argument("--max-concurrency", type=int, default=500)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--system-prompt", default=None)
     parser.add_argument("--editor-model", default="openai/gpt-4.1")

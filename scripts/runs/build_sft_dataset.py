@@ -77,7 +77,10 @@ def _parse_sources(raw: str) -> list[SourceRequest]:
 
 
 def _default_output_stem(
-    base_model: str, sources: list[SourceRequest], analysis_channel: bool,
+    base_model: str,
+    sources: list[SourceRequest],
+    analysis_channel: bool,
+    include_instruction: bool = False,
 ) -> str:
     model_short = base_model.split("/")[-1].lower()
     names = [s.name for s in sources]
@@ -85,8 +88,9 @@ def _default_output_stem(
         composition = names[0]
     else:
         composition = "mixed"
-    # keep "-stripped" suffix for consistency with legacy naming; ac optional
-    suffix = "-stripped"
+    # Distinguish with-instruction generation in the filename so the two
+    # variants don't collide in results/sft/.
+    suffix = "-with-instr" if include_instruction else "-stripped"
     if analysis_channel:
         suffix += "-ac"
     return f"{model_short}-{composition}-sft{suffix}"
@@ -104,7 +108,10 @@ def _build_config_from_args(args: argparse.Namespace) -> BuildConfig:
         raise ValueError("--sources produced an empty list")
 
     ac = _resolve_analysis_channel(args.analysis_channel, args.base_model)
-    stem = args.output_stem or _default_output_stem(args.base_model, sources, ac)
+    include_instr = bool(args.include_instruction)
+    stem = args.output_stem or _default_output_stem(
+        args.base_model, sources, ac, include_instruction=include_instr,
+    )
     output_dir = Path(args.output_dir)
     output_path = args.output or output_dir / f"{stem}.parquet"
     checkpoint_path = args.checkpoint or output_dir / f"{stem}.checkpoint.jsonl"
@@ -129,6 +136,10 @@ def _build_config_from_args(args: argparse.Namespace) -> BuildConfig:
         sources=sources,
         editor_model=args.editor_model,
         analysis_channel=ac,
+        include_instruction_at_generation=include_instr,
+        exclude_non_compliant=not args.keep_non_compliant,
+        final_retry_non_compliant=not args.no_final_retry,
+        filter_non_latin_questions=not args.keep_non_latin_questions,
         seed=args.seed,
         max_transform_retries=args.max_transform_retries,
         run_id=args.run_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
@@ -138,7 +149,7 @@ def _build_config_from_args(args: argparse.Namespace) -> BuildConfig:
 def _dry_run(config: BuildConfig) -> None:
     import pandas as pd
     from controllability.training.sft_builder import (
-        _load_reasonif_templates, _unwrap,
+        _load_reasonif_templates, _unwrap, filter_non_latin_questions,
     )
 
     print("\n[DRY RUN] Configuration:")
@@ -147,6 +158,7 @@ def _dry_run(config: BuildConfig) -> None:
     print(f"  strategy:          {config.strategy}")
     print(f"  editor_model:      {config.editor_model}")
     print(f"  analysis_channel:  {config.analysis_channel}")
+    print(f"  include_instr:     {config.include_instruction_at_generation}")
     print(f"  output:            {config.output_path}")
     print(f"  checkpoint:        {config.checkpoint_path}")
     print(f"  question_source:   {config.question_source_parquet}")
@@ -159,6 +171,10 @@ def _dry_run(config: BuildConfig) -> None:
     questions = [str(_unwrap(x) or "").strip() for x in df["original_prompt"].tolist()]
     questions = [q for q in questions if q]
     print(f"\n  Question pool: {len(questions)} entries")
+    if config.filter_non_latin_questions:
+        questions, dropped_nl = filter_non_latin_questions(questions)
+        print(f"  After non-Latin filter: {len(questions)} entries "
+              f"(dropped {len(dropped_nl)})")
 
     reasonif_templates = {}
     if any(s.name == "reasonif" for s in config.sources):
@@ -237,6 +253,40 @@ def main() -> None:
         help="Force 'reasoning' terminology regardless of model",
     )
 
+    parser.add_argument(
+        "--include-instruction", action="store_true",
+        help=(
+            "Include the reasoning constraint in the Stage-1 generation prompt "
+            "(matches what the trained model sees at deployment). Adds a "
+            "meta-removal pre-edit, pre-compliance check, and pre-picks "
+            "suppression keywords from the question. Default: False (legacy "
+            "behavior — instruction stripped, edit-after-the-fact)."
+        ),
+    )
+    parser.add_argument(
+        "--keep-non-compliant", action="store_true",
+        help=(
+            "Keep non-compliant rows in the output parquet (column "
+            "``compliant`` records True/False). Default: drop them."
+        ),
+    )
+    parser.add_argument(
+        "--no-final-retry", action="store_true",
+        help=(
+            "Disable the Stage-2 final retry pass on non-compliant rows. "
+            "Default: enabled — re-runs the per-row transform once more on "
+            "any row still non-compliant after the in-row retry budget."
+        ),
+    )
+    parser.add_argument(
+        "--keep-non-latin-questions", action="store_true",
+        help=(
+            "Keep questions whose natural answer requires non-Latin script "
+            "(e.g. 'translate \"thank you\" into Japanese'). Default: drop "
+            "them — they trip the strict lowercase/uppercase graders because "
+            "non-Latin alphabetic chars have no case."
+        ),
+    )
     parser.add_argument(
         "--judge-ignore-question", action="store_true",
         help="Additionally run an LLM judge over cotcontrol/ignore_question rows",

@@ -286,6 +286,7 @@ class LaunchConfig:
                 model=m["model"],
                 base_model=m["base_model"],
                 parquet=m["parquet"],
+                load_checkpoint_path=m.get("load_checkpoint_path"),
                 log_path=m.get("log_path", m["short_name"]),
                 renderer_type=m["renderer_type"],
                 reasoning_effort=m.get("reasoning_effort", "none"),
@@ -438,7 +439,14 @@ def run_single_ft(short_name: str, cfg: LaunchConfig) -> None:
         adam_beta1=cfg.training.adam_beta1,
         adam_beta2=cfg.training.adam_beta2,
         adam_eps=cfg.training.adam_eps,
+        # Continuation: when load_checkpoint_path is set on the spec, the
+        # tinker_cookbook trainer creates a training client from that state
+        # rather than from a fresh LoRA. Used by the v5 continuation pipeline.
+        load_checkpoint_path=spec.load_checkpoint_path,
     )
+    if spec.load_checkpoint_path:
+        logging.info("Continuation FT — loading state from %s",
+                     spec.load_checkpoint_path)
     asyncio.run(train_main(train_config))
     logging.info("Training complete for %s", spec.model)
 
@@ -636,14 +644,31 @@ async def orchestrate(
         raise ValueError("No models selected")
 
     # -- Start FT subprocesses (unless eval-only) --
+    # Per-spec parquet wait: if the dataset hasn't been written yet (we
+    # were invoked concurrently with dataset gen), wait for it to land
+    # before spawning that spec's FT subprocess. Each spec is launched
+    # independently as soon as its parquet is ready, so fast datasets
+    # don't wait on slow ones.
     ft_procs: dict[str, asyncio.subprocess.Process] = {}
+    parquet_dir = RESULTS_DIR / "sft"
+
+    async def _wait_and_spawn_ft(spec: FTModelSpec) -> None:
+        parquet_path = parquet_dir / spec.parquet
+        if not parquet_path.exists():
+            logging.info("FT [%s] waiting for parquet: %s", spec.short_name, spec.parquet)
+            while not parquet_path.exists():
+                await asyncio.sleep(15)
+            logging.info("FT [%s] parquet ready, spawning subprocess", spec.short_name)
+        log_file = RESULTS_DIR / "logs" / f"{cfg.run_id}_{spec.short_name}_ft.log"
+        cmd = _ft_cmd(spec.short_name, config_path, cfg.run_id)
+        logging.info("Launching FT: %s (log: %s)", spec.short_name, log_file)
+        proc = await _spawn_subprocess(cmd, log_file)
+        ft_procs[spec.short_name] = proc
+
+    ft_spawn_tasks: list[asyncio.Task] = []
     if not eval_only:
         for spec in specs:
-            log_file = RESULTS_DIR / "logs" / f"{cfg.run_id}_{spec.short_name}_ft.log"
-            cmd = _ft_cmd(spec.short_name, config_path, cfg.run_id)
-            logging.info("Launching FT: %s (log: %s)", spec.short_name, log_file)
-            proc = await _spawn_subprocess(cmd, log_file)
-            ft_procs[spec.short_name] = proc
+            ft_spawn_tasks.append(asyncio.create_task(_wait_and_spawn_ft(spec)))
     else:
         logging.info("--eval-only: skipping FT phase, using existing checkpoints")
 
@@ -696,14 +721,65 @@ async def orchestrate(
                 eval_tasks.add(task)
                 task.add_done_callback(lambda t, k=key: _record_eval_result(k, t, results))
 
+    def queue_evals_global_priority() -> None:
+        """Cross-model priority queueing.
+
+        Iterates checkpoints in priority order *across all models* before
+        moving to the next priority level. So in a single poll cycle, every
+        model's ready ckpt 50 evals get queued (and therefore semaphore-
+        prioritized) before any model's ckpt 100 evals — even if some
+        models finished ckpt 100 in this cycle.
+
+        Per-model behavior (no ckpt available → skip) keeps the dispatcher
+        non-blocking: a slow model's missing ckpt 50 doesn't hold back fast
+        models that have already moved on.
+        """
+        allowed = set(cfg.eval.allowed_checkpoints or [])
+        # Read each model's ready ckpts once per cycle.
+        per_spec_ckpts: dict[str, list[dict]] = {}
+        for spec in specs:
+            ckpts = load_checkpoints_jsonl(cfg.log_path_for(spec))
+            if cfg.eval.only_final_checkpoint:
+                ckpts = [c for c in ckpts if c.get("name") == "final"]
+            if allowed:
+                ckpts = [c for c in ckpts if c.get("name") in allowed]
+            per_spec_ckpts[spec.short_name] = ckpts
+
+        # Walk priority levels in order; for each level, iterate models.
+        priority_levels = list(cfg.eval.checkpoint_priority or []) or [
+            c.get("name", "") for spec in specs for c in per_spec_ckpts[spec.short_name]
+        ]
+        seen_levels: set[str] = set()
+        for level in priority_levels:
+            if level in seen_levels:
+                continue
+            seen_levels.add(level)
+            for spec in specs:
+                for ckpt in per_spec_ckpts[spec.short_name]:
+                    if ckpt.get("name") != level:
+                        continue
+                    for ds in cfg.eval.datasets:
+                        key = (spec.short_name, level, ds.key)
+                        if key in dispatched:
+                            continue
+                        dispatched.add(key)
+                        task = asyncio.create_task(
+                            run_one_eval(spec.short_name, ds.key, level),
+                        )
+                        eval_tasks.add(task)
+                        task.add_done_callback(
+                            lambda t, k=key: _record_eval_result(k, t, results),
+                        )
+
+        # Catch any ckpt that doesn't appear in checkpoint_priority (fallback).
+        for spec in specs:
+            queue_evals_for(spec)
+
     # -- Main loop: poll + dispatch --
     while True:
-        # Poll each FT's checkpoints.jsonl
-        for spec in specs:
-            if (not eval_only) and spec.short_name in ft_done:
-                # already queued everything for this model
-                pass
-            queue_evals_for(spec)
+        # Cross-model priority dispatch — earlier ckpts across ALL models
+        # win the semaphore queue before later ckpts on any model.
+        queue_evals_global_priority()
 
         # Check FT process exits
         if not eval_only:
@@ -721,7 +797,13 @@ async def orchestrate(
         still_running = {t for t in eval_tasks if not t.done()}
         eval_tasks = still_running
 
-        all_fts_done = eval_only or len(ft_done) == len(ft_procs)
+        # All FTs done = every spawn task settled AND every spawned proc
+        # has exited. While we're still waiting on parquets, ft_spawn_tasks
+        # contain pending coroutines and we must NOT exit the loop.
+        spawn_tasks_done = all(t.done() for t in ft_spawn_tasks)
+        all_fts_done = eval_only or (
+            spawn_tasks_done and len(ft_done) == len(ft_procs)
+        )
         no_more_evals = not eval_tasks
         if all_fts_done and no_more_evals:
             break

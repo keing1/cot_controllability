@@ -66,12 +66,78 @@ from controllability.training.transforms import (
     BASE_MODEL_TRANSFORMS,
     COTCONTROL_MODES,
     LLM_TRANSFORMS,
+    LLM_TRANSFORMS_WITH_INSTRUCTION,
     REASONIF_MODES,
     TransformContext,
     apply_transform,
     filter_constraint_args,
+    pick_keywords_from_question,
+    remove_instruction_meta,
 )
 from controllability.types import InferenceRequest, Sample
+
+
+# ---------------------------------------------------------------------------
+# Question pool filtering
+# ---------------------------------------------------------------------------
+#
+# A handful of questions in the default ReasonIF-FT pool naturally produce
+# non-Latin script in the answer (Japanese hiragana, etc.). These trip the
+# strict CoTControl ``isalpha()`` / ``islower()`` graders for
+# lowercase_thinking and uppercase_thinking — Japanese ``あ`` is alphabetic
+# but has no case, so the row counts as non-compliant even when every Latin
+# letter is correctly cased. We filter these out at the pool stage so
+# they're never assigned to any mode.
+#
+# Filter targets only:
+#   * Translate-pattern questions whose target language uses a non-Latin
+#     script (Japanese, Chinese, Korean, Hindi, etc.).
+#   * Questions whose own text contains non-ASCII characters (e.g. German
+#     umlauts in pronunciation prompts).
+# All other multilingual / language-mentioning questions stay — they
+# typically don't require non-Latin output.
+
+_NON_LATIN_LANGUAGES = (
+    "japanese", "chinese", "mandarin", "cantonese", "korean", "hindi",
+    "arabic", "russian", "thai", "greek", "hebrew", "persian", "farsi",
+    "urdu", "bengali", "tamil", "tibetan", "ukrainian", "bulgarian",
+    "serbian", "armenian", "georgian", "amharic", "sinhala", "khmer",
+    "lao", "burmese", "mongolian",
+)
+
+_TRANSLATE_PATTERN = re.compile(
+    r"\b(translate|translation|how (do|to) (you )?(say|write|spell|pronounce))\b",
+    re.IGNORECASE,
+)
+_NON_LATIN_LANG_PATTERN = re.compile(
+    r"\b(" + "|".join(_NON_LATIN_LANGUAGES) + r")\b",
+    re.IGNORECASE,
+)
+def _is_non_latin_question(q: str) -> bool:
+    """True if ``q`` would naturally produce non-Latin script in the answer.
+
+    We ONLY flag translate-style questions whose target is a non-Latin
+    script (Japanese, Chinese, Hindi, etc.). A blanket "any non-ASCII char"
+    rule was tried earlier but proved too aggressive — it caught hundreds
+    of legitimate programming / pronunciation questions whose answer is
+    perfectly Latin-scripted (e.g. German `Eichhörnchen` pronunciation,
+    code with Unicode quotes).
+    """
+    return bool(
+        _TRANSLATE_PATTERN.search(q) and _NON_LATIN_LANG_PATTERN.search(q)
+    )
+
+
+def filter_non_latin_questions(questions: list[str]) -> tuple[list[str], list[str]]:
+    """Return (kept, dropped) — drops questions that would force non-Latin output."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    for q in questions:
+        if _is_non_latin_question(q):
+            dropped.append(q)
+        else:
+            kept.append(q)
+    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -158,14 +224,47 @@ class BuildConfig:
     # Editor model for reasonif LLM transforms + cotcontrol word-suppression
     editor_model: str = "openai/gpt-5.4"
 
+    # Stage-1 prompt variant.
+    # * False (default, current behavior): the reasoning constraint is stripped
+    #   from the Stage-1 prompt, so the model produces unconstrained reasoning
+    #   that Stage-2 edits to compliance.
+    # * True: the Stage-1 prompt includes the constraint instruction (matches
+    #   what the trained model will see at deployment). Stage-2 then runs a
+    #   meta-removal pre-edit, a pre-compliance check, and only edits rows
+    #   that aren't already compliant. Word-suppression keywords are pre-picked
+    #   from the question alone so the constraint can be baked into the prompt.
+    include_instruction_at_generation: bool = False
+
     # Prompt rewriting
     analysis_channel: bool | None = None          # None → auto (True for gpt-oss)
 
     # Random seed (controls question sampling + ignore_question target pick)
     seed: int = 42
 
-    # Transform retries on non-compliance
+    # Transform retries on non-compliance (within a single Stage-2 attempt
+    # for one row).
     max_transform_retries: int = 3
+
+    # After Stage 2 finishes, optionally run ONE additional pass on rows that
+    # are still non-compliant. The retry re-runs the full per-row transform
+    # pipeline (meta-removal pre-edit → pre-compliance check → main edit) so
+    # it picks up editor nondeterminism. Cheap because it touches only the
+    # already-failing minority. Set to False to disable.
+    final_retry_non_compliant: bool = True
+
+    # Whether to drop non-compliant rows from the output parquet entirely.
+    # When True (default), only rows that passed the canonical grader make
+    # it into the training data; non-compliant rows are dropped at write
+    # time. When False, non-compliant rows are kept and the ``compliant``
+    # column records True/False (legacy behavior).
+    exclude_non_compliant: bool = True
+
+    # Whether to drop questions whose natural answer requires non-Latin
+    # script (e.g. "translate 'thank you' into Japanese"). These trip the
+    # strict ``isalpha`` / ``islower`` lowercase_thinking grader because
+    # hiragana / Chinese / Hindi / Arabic chars are alphabetic but have
+    # no case. Affects ~5/953 questions in the default ReasonIF-FT pool.
+    filter_non_latin_questions: bool = True
 
     # Metadata
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -232,26 +331,66 @@ def _make_cc_sample(
 
 
 def _build_stage1_prompt(
-    question: str, source: str, analysis_channel: bool,
+    question: str,
+    source: str,
+    analysis_channel: bool,
+    *,
+    include_instruction: bool = False,
+    mode: str | None = None,
+    constraint_args: dict | None = None,
+    instruction_description: str = "",
 ) -> str:
     """Source-aware Stage-1 generation prompt.
 
-    For each source it returns the eval prompt with the reasoning constraint
-    stripped — i.e. the question presented in the same shape the trained
-    model will see at eval time, but without the constraint. For CC also
-    without the MCQ format line (matches the SFT training prompt format).
+    With ``include_instruction=False`` (default, legacy behavior): returns the
+    eval prompt with the reasoning constraint stripped — i.e. the question
+    presented in the same shape the trained model will see at eval time,
+    but without the constraint. For CC also without the MCQ format line.
+
+    With ``include_instruction=True``: returns the FULL eval-equivalent
+    prompt including the constraint instruction. Matches what the trained
+    model is expected to handle at deployment. Mode/constraint_args/
+    instruction_description are required so the constraint text can be
+    rendered (and for word_suppression the keyword(s) must already be
+    populated in constraint_args).
     """
+    if not include_instruction:
+        if source == "reasonif":
+            return build_reasonif_baseline_prompt(question, analysis_channel)
+        if source == "cotcontrol":
+            sample = Sample(
+                id="_", dataset="_", question=question, correct_answer="",
+                options=None, metadata={},
+            )
+            _, user = build_cotcontrol_prompts(
+                "baseline", sample,
+                model_name=_model_name_for_ac(analysis_channel),
+                mcq_format=False,
+            )
+            return user
+        raise ValueError(f"Unknown source: {source}")
+
+    # With-instruction path: build the full eval-equivalent prompt.
+    if mode is None:
+        raise ValueError("mode is required when include_instruction=True")
+
     if source == "reasonif":
-        return build_reasonif_baseline_prompt(question, analysis_channel)
-    if source == "cotcontrol":
-        sample = Sample(
-            id="_", dataset="_", question=question, correct_answer="",
-            options=None, metadata={},
+        desc = instruction_description or ""
+        # number_words descriptions reference the word count in
+        # constraint_args; if num_words is set, ensure the description
+        # reflects it (Stage-2 may later rewrite this dynamically per row).
+        if mode == "number_words" and constraint_args and constraint_args.get("num_words"):
+            desc = f"When reasoning, respond with less than {int(constraint_args['num_words'])} words."
+        if analysis_channel:
+            desc = _rewrite_rif_desc_for_ac(desc)
+        return build_reasonif_prompt_from_parts(
+            question, desc, analysis_channel=analysis_channel,
         )
+    if source == "cotcontrol":
+        sample = _make_cc_sample(question, mode, constraint_args, {})
+        model_name = _model_name_for_ac(analysis_channel)
         _, user = build_cotcontrol_prompts(
-            "baseline", sample,
-            model_name=_model_name_for_ac(analysis_channel),
-            mcq_format=False,
+            mode, sample, model_name=model_name, mcq_format=False,
         )
         return user
     raise ValueError(f"Unknown source: {source}")
@@ -455,15 +594,36 @@ def _canonical_args_for(
 # ---------------------------------------------------------------------------
 
 
-_CheckpointKey = tuple[int, str]  # (question_idx, source)
+# (question_id, source, mode_or_blank, include_instruction).
+# ``question_id`` is a stable hash of the question text — robust to changes
+# in pool ordering, additions, or filtering (which would shift integer
+# question_idx values and silently mismatch cached rollouts to the wrong
+# question).
+# When include_instruction=False, mode_or_blank is "" — the Stage-1 prompt is
+# mode-independent so a single rollout is shared across modes for a given
+# (question, source). When include_instruction=True, the Stage-1 prompt is
+# mode-specific so each (question, source, mode) gets its own rollout.
+_CheckpointKey = tuple[str, str, str, bool]
+
+
+def _question_id(question: str) -> str:
+    """Stable identifier for a question — hash of the trimmed text.
+
+    Decoupled from question_idx so that changes to the question pool
+    (filtering, reordering, additions) don't silently mismatch cached
+    Stage-1 rollouts to the wrong assignments.
+    """
+    import hashlib
+    return hashlib.sha1(question.strip().encode("utf-8")).hexdigest()[:16]
 
 
 def _load_checkpoint(path: Path) -> dict[_CheckpointKey, dict]:
-    """Load Stage-1 checkpoint records keyed by (question_idx, source).
+    """Load Stage-1 checkpoint records keyed by (q_id, source, mode, include).
 
     Records produced by older builds (without a `source` field) are rejected
-    with a clear error: the prompt format is now source-aware, so reusing
-    them would silently train against mismatched prompts.
+    with a clear error. Records that have an integer ``question_idx`` but no
+    ``question_id`` field are migrated on-the-fly: we recover the question
+    text from the ``generation_prompt`` and hash it.
     """
     completed: dict[_CheckpointKey, dict] = {}
     if not path.exists():
@@ -480,8 +640,41 @@ def _load_checkpoint(path: Path) -> dict[_CheckpointKey, dict]:
                     "(missing 'source' field). Delete the checkpoint and re-run "
                     "to regenerate rollouts under the new prompt format."
                 )
-            completed[(rec["question_idx"], rec["source"])] = rec
+            include = bool(rec.get("include_instruction", False))
+            mode = rec.get("mode", "") if include else ""
+            qid = rec.get("question_id")
+            if not qid:
+                # Migrate older records: extract question text from the
+                # generation_prompt and hash it.
+                qtext = _extract_question_from_prompt(
+                    rec.get("generation_prompt", ""), rec.get("source", ""),
+                )
+                if not qtext:
+                    raise ValueError(
+                        f"Checkpoint record in {path} has neither "
+                        "'question_id' nor a recognizable question in "
+                        "'generation_prompt' — delete and re-run."
+                    )
+                qid = _question_id(qtext)
+                rec["question_id"] = qid
+            completed[(qid, rec["source"], mode, include)] = rec
     return completed
+
+
+def _extract_question_from_prompt(prompt: str, source: str) -> str:
+    """Best-effort recovery of the original question from a saved Stage-1
+    generation prompt. Used to migrate pre-question_id checkpoints."""
+    if not prompt:
+        return ""
+    # CC baseline / with-instruction prompt format: starts with "Question: ..."
+    m = re.search(r"^Question:\s*(.+?)(?:\n\n|$)", prompt, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # ReasonIF baseline format: "...Here is the question:\n\n<question>"
+    m = re.search(r"Here is the question:\s*(.+?)$", prompt, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return prompt.strip()
 
 
 def _append_checkpoint(path: Path, record: dict) -> None:
@@ -587,42 +780,54 @@ async def stage1_generate(
     base_client: InferenceClient,
     analysis_channel: bool,
 ) -> dict[_CheckpointKey, dict]:
-    """Run Stage-1 rollouts keyed by ``(question_idx, source)``.
+    """Run Stage-1 rollouts.
 
-    Each (question, source) pair gets its own rollout because the Stage-1
-    prompt is source-aware (see ``_build_stage1_prompt``). When a question
-    is assigned to only one source the cost is identical to per-question
-    dedupe; questions shared across sources cost one extra rollout each.
+    Dedup behavior depends on ``config.include_instruction_at_generation``:
+      * False → one rollout per (question, source) (mode-independent prompt).
+      * True  → one rollout per (question, source, mode) (mode-specific prompt
+        because the constraint instruction is embedded).
 
     Validates each rollout against the malformed criteria. On detection,
     retries once. Records that remain malformed after retry are stored with
     ``error="malformed_think:<kind>"`` so stage 2/3 skip them.
 
-    Returns a mapping ``(question_idx, source) -> {reasoning, content,
-    error, generation_prompt, source}``.
+    Returns a mapping ``key -> {reasoning, content, error, generation_prompt,
+    source, mode, include_instruction}``.
     """
-    # Dedupe by (question_idx, source)
-    unique: dict[_CheckpointKey, str] = {}
+    include_instruction = config.include_instruction_at_generation
+
+    # Dedupe by the appropriate key shape — keyed by question text hash
+    # (NOT integer question_idx) so cached rollouts survive pool reorderings.
+    unique: dict[_CheckpointKey, Assignment] = {}
     for a in assignments:
-        unique.setdefault((a.question_idx, a.source), a.question)
+        mode_key = a.mode if include_instruction else ""
+        key = (_question_id(a.question), a.source, mode_key, include_instruction)
+        unique.setdefault(key, a)
 
     completed = _load_checkpoint(config.checkpoint_path)
-    pending = [(key, q) for key, q in unique.items() if key not in completed]
+    pending = [(key, a) for key, a in unique.items() if key not in completed]
 
     if not pending:
         print(f"  All {len(unique)} rollouts already in checkpoint")
         return completed
 
-    print(f"  {len(pending)} pending / {len(unique)} unique (question, source) "
-          f"pairs (resumed {len(completed)})")
+    label = "(question, source, mode)" if include_instruction else "(question, source)"
+    print(f"  {len(pending)} pending / {len(unique)} unique {label} "
+          f"keys (resumed {len(completed)})")
 
     requests: list[InferenceRequest] = []
     ordered_keys: list[_CheckpointKey] = []
     ordered_prompts: list[str] = []
-    for (idx, source), q in pending:
-        generation_prompt = _build_stage1_prompt(q, source, analysis_channel)
+    for key, a in pending:
+        generation_prompt = _build_stage1_prompt(
+            a.question, a.source, analysis_channel,
+            include_instruction=include_instruction,
+            mode=a.mode,
+            constraint_args=a.constraint_args,
+            instruction_description=a.instruction_description,
+        )
         requests.append(await _build_stage1_request(config, generation_prompt))
-        ordered_keys.append((idx, source))
+        ordered_keys.append(key)
         ordered_prompts.append(generation_prompt)
 
     responses = await run_batch(
@@ -632,11 +837,22 @@ async def stage1_generate(
         desc="Stage 1: Generate",
     )
 
+    # Map qid → assignment so we can store the question text alongside
+    # each new record (helps debugging + future migrations).
+    qid_to_assignment: dict[str, Assignment] = {
+        _question_id(a.question): a for a in assignments
+    }
+
     def _record(key: _CheckpointKey, resp, gen_prompt: str, error: str | None) -> dict:
-        idx, source = key
+        qid, source, mode_key, include = key
+        a = qid_to_assignment.get(qid)
         return {
-            "question_idx": idx,
+            "question_id": qid,
+            "question_idx": a.question_idx if a else None,  # legacy / debug
+            "question": a.question if a else "",
             "source": source,
+            "mode": mode_key,
+            "include_instruction": include,
             "reasoning": resp.reasoning,
             "content": resp.content,
             "error": error,
@@ -818,6 +1034,28 @@ async def stage2_transform(
     tasks = [_process(a) for a in assignments]
     results = await tqdm_asyncio.gather(*tasks, desc="Stage 2: Transform")
 
+    # Optional final-retry pass: re-run any rows still non-compliant (and
+    # not errored). Cheap because it touches only the failing minority and
+    # picks up editor nondeterminism. Replaces the original result whenever
+    # the retry succeeds; keeps the original otherwise so we don't regress.
+    if config.final_retry_non_compliant:
+        retry_indices = [
+            i for i, r in enumerate(results)
+            if r.get("error") is None and not r.get("compliant")
+        ]
+        if retry_indices:
+            print(f"\n  Final retry: {len(retry_indices)} non-compliant rows")
+            retry_tasks = [_process(results[i]["assignment"]) for i in retry_indices]
+            retry_results = await tqdm_asyncio.gather(
+                *retry_tasks, desc="Stage 2: Final retry",
+            )
+            n_recovered = 0
+            for i, retry_r in zip(retry_indices, retry_results):
+                if retry_r.get("error") is None and retry_r.get("compliant"):
+                    results[i] = retry_r
+                    n_recovered += 1
+            print(f"  Final retry: recovered {n_recovered}/{len(retry_indices)}")
+
     # Aggregate compliance stats from per-row results
     for r in results:
         a: Assignment = r["assignment"]
@@ -847,6 +1085,134 @@ async def stage2_transform(
     return results
 
 
+def _can_pre_check_compliance(
+    a: Assignment, work_args: dict | None, include_instruction: bool,
+) -> bool:
+    """Whether the pre-compliance check can be run before any transform.
+
+    Skipped when the grader needs information that hasn't been picked yet:
+      * cotcontrol/word_suppression without a keyword (without-instruction
+        case picks it after seeing the rollout).
+      * cotcontrol/multiple_word_suppression without keywords.
+      * cotcontrol/ignore_question — uses an LLM judge; pre-checking would
+        burn a judge call on every row regardless of whether it matters.
+    """
+    if a.source == "cotcontrol":
+        if a.mode == "ignore_question":
+            return False
+        if a.mode == "word_suppression":
+            kw = (work_args or {}).get("keyword")
+            return bool(kw)
+        if a.mode == "multiple_word_suppression":
+            kws = (work_args or {}).get("keywords") or []
+            return len(kws) > 0
+    return True
+
+
+def _materialize_extras_for_compliant(
+    a: Assignment, work_args: dict | None,
+) -> dict:
+    """Build the ``extras`` dict that downstream record-building expects when
+    we skip the transform because the rollout was already compliant."""
+    extras: dict = {}
+    if a.source == "cotcontrol":
+        if a.mode == "word_suppression":
+            kw = (work_args or {}).get("keyword") or ""
+            extras["keyword"] = kw
+        elif a.mode == "multiple_word_suppression":
+            kws = (work_args or {}).get("keywords") or []
+            extras["keywords"] = list(kws)
+    return extras
+
+
+async def _prepick_suppression_keywords(
+    config: BuildConfig,
+    assignments: list[Assignment],
+    editor_client: InferenceClient | None,
+) -> None:
+    """For the with-instruction case, pre-pick suppression keywords from the
+    QUESTION (not the rollout) so the constraint can be baked into the
+    Stage-1 prompt. Mutates ``a.constraint_args`` in place.
+
+    Without-instruction rows are left alone — keywords are picked from the
+    rollout in Stage-2 as before.
+    """
+    if not config.include_instruction_at_generation:
+        return
+    if editor_client is None:
+        return
+
+    targets: list[tuple[Assignment, int]] = []
+    for a in assignments:
+        if a.source != "cotcontrol":
+            continue
+        if a.mode == "word_suppression":
+            n = 1
+        elif a.mode == "multiple_word_suppression":
+            n = 3
+        else:
+            continue
+        existing = a.constraint_args or {}
+        if a.mode == "word_suppression" and existing.get("keyword"):
+            continue
+        if a.mode == "multiple_word_suppression" and existing.get("keywords"):
+            continue
+        targets.append((a, n))
+
+    if not targets:
+        return
+
+    print(f"  Pre-picking suppression keywords for {len(targets)} rows "
+          f"(with-instruction generation)")
+
+    sem = asyncio.Semaphore(max(1, config.max_concurrency))
+
+    async def _one(a: Assignment, n: int) -> tuple[Assignment, int, list[str]]:
+        # Per-assignment deterministic RNG matches _process_one_assignment's
+        # seed scheme so a given row always gets the same coin flip.
+        local_rng = random.Random(config.seed * 1_000_003 + a.row_idx)
+        ctx = TransformContext(
+            llm_client=editor_client,
+            editor_model=config.editor_model,
+            question=a.question,
+            full_prompt=a.question,
+            include_instruction=True,
+            rng=local_rng,
+            max_tokens=400,
+        )
+        # 50/50 inclusion only meaningful for n=1; n>1 keeps default
+        # ("at least one not in question").
+        prompt_inclusion: str | None = None
+        if n == 1:
+            prompt_inclusion = "in_prompt" if local_rng.random() < 0.5 else "not_in_prompt"
+        async with sem:
+            try:
+                picks = await pick_keywords_from_question(
+                    a.question, n, ctx, prompt_inclusion=prompt_inclusion,
+                )
+            except Exception:  # noqa: BLE001
+                picks = []
+        return a, n, picks
+
+    from tqdm.asyncio import tqdm_asyncio
+    results = await tqdm_asyncio.gather(
+        *[_one(a, n) for (a, n) in targets],
+        desc="Stage 0.5: Pre-pick suppression keywords",
+    )
+
+    n_filled = 0
+    for a, n, picks in results:
+        if not picks:
+            continue
+        a.constraint_args = dict(a.constraint_args) if a.constraint_args else {}
+        if a.mode == "word_suppression":
+            a.constraint_args["keyword"] = picks[0]
+        elif a.mode == "multiple_word_suppression":
+            a.constraint_args["keywords"] = list(picks[:n])
+        n_filled += 1
+    print(f"  Pre-picked keywords for {n_filled}/{len(targets)} rows")
+
+
 async def _process_one_assignment(
     a: Assignment,
     rollouts: dict[_CheckpointKey, dict],
@@ -859,10 +1225,22 @@ async def _process_one_assignment(
 ) -> dict:
     """Transform + verify compliance for a single assignment.
 
+    Flow:
+      1. Look up the matching Stage-1 rollout. Skip if missing/errored.
+      2. (with-instruction only) Run the meta-removal pre-edit so the
+         reasoning doesn't narrate the constraint.
+      3. Pre-check compliance against the canonical grader. If already
+         compliant, skip the mode-specific edit entirely. (Skipped for
+         modes whose target/keyword is unknown until Stage-2 picks it.)
+      4. Otherwise run the mode-specific transform with retries.
+
     Returns a dict with ``assignment``, ``error``, ``compliant``, ``retries``,
     and (on success) a ``record`` ready for stage3 output.
     """
-    rollout = rollouts.get((a.question_idx, a.source))
+    include_instruction = config.include_instruction_at_generation
+    mode_key = a.mode if include_instruction else ""
+    rollout_key = (_question_id(a.question), a.source, mode_key, include_instruction)
+    rollout = rollouts.get(rollout_key)
     if rollout is None or rollout.get("error"):
         err = rollout.get("error") if rollout else "missing rollout"
         return {"assignment": a, "error": err, "compliant": None, "retries": 0}
@@ -881,6 +1259,8 @@ async def _process_one_assignment(
         base_client=base_client,
         base_model=config.base_model,
         question=a.question,
+        full_prompt=generation_prompt,
+        include_instruction=include_instruction,
         question_pool=question_pool,
         rng=local_rng,
         max_tokens=config.max_tokens,
@@ -888,14 +1268,47 @@ async def _process_one_assignment(
         reasoning_effort=config.reasoning_effort,
     )
 
+    # Mutable args copy so transforms can write back (e.g. number_words).
+    work_args = dict(a.constraint_args) if a.constraint_args else None
+
+    # 2. Meta-removal pre-edit (with-instruction only). Falls back to the
+    #    original reasoning if the editor call fails — better to keep a
+    #    partially-meta'd row than to drop it entirely.
+    if include_instruction and editor_client is not None and raw_reasoning.strip():
+        try:
+            raw_reasoning = await remove_instruction_meta(raw_reasoning, ctx)
+        except Exception:  # noqa: BLE001 — never fail the row on pre-edit issues
+            pass
+
+    # 3. Pre-compliance check. Skip for modes where the keyword/target isn't
+    #    known yet (without-instruction word_suppression / multi) — there's
+    #    nothing meaningful to check before the transform picks them.
+    can_pre_check = _can_pre_check_compliance(a, work_args, include_instruction)
+    if can_pre_check:
+        try:
+            already_compliant = _verify_compliance(
+                a.source, a.mode, raw_reasoning, work_args, {},
+            )
+        except Exception:  # noqa: BLE001
+            already_compliant = False
+        if already_compliant:
+            extras = _materialize_extras_for_compliant(a, work_args)
+            record = _build_output_record(
+                a, raw_reasoning, content, generation_prompt, work_args, extras,
+                analysis_channel,
+            )
+            record["compliant"] = True
+            record["error"] = None
+            return {
+                "assignment": a, "error": None, "compliant": True,
+                "retries": 0, "record": record,
+            }
+
     transformed: str | None = None
     extras: dict = {}
     last_error: str | None = None
     compliant = False
     retries_used = 0
-
-    # Mutable args copy so transforms can write back (e.g. number_words).
-    work_args = dict(a.constraint_args) if a.constraint_args else None
 
     for attempt in range(1, config.max_transform_retries + 1):
         try:
@@ -1048,18 +1461,29 @@ def stage3_write(
 ) -> dict:
     """Write the parquet (with raw reasoning in ``messages_original``) and
     the metadata sidecar. Returns a summary dict."""
+    include_instruction = config.include_instruction_at_generation
     good_rows: list[dict] = []
+    n_excluded_non_compliant = 0
     for r in results:
         if r.get("error") is not None:
             continue
         rec = r["record"]
+        if config.exclude_non_compliant and not rec.get("compliant"):
+            n_excluded_non_compliant += 1
+            continue
         a: Assignment = r["assignment"]
-        rollout = rollouts.get((a.question_idx, a.source), {})
+        mode_key = a.mode if include_instruction else ""
+        rollout = rollouts.get(
+            (_question_id(a.question), a.source, mode_key, include_instruction), {},
+        )
         raw_reasoning = rollout.get("reasoning", "") or ""
         rec["messages_original"] = _messages_row(
             rec["user_prompt"], raw_reasoning, rec["content"],
         )
         good_rows.append(rec)
+    if n_excluded_non_compliant:
+        print(f"  Excluded {n_excluded_non_compliant} non-compliant rows "
+              f"(exclude_non_compliant=True)")
 
     print(f"\n  Writing {len(good_rows)} rows to parquet "
           f"({len(results) - len(good_rows)} errored, dropped)")
@@ -1325,6 +1749,19 @@ async def build_sft_dataset(
     questions = [str(_unwrap(x) or "").strip() for x in df_src["original_prompt"].tolist()]
     questions = [q for q in questions if q]
 
+    # Optional pool-level filter — drop questions whose natural answer
+    # forces non-Latin script (those break the strict lowercase / uppercase
+    # graders even when the model behaves correctly).
+    if config.filter_non_latin_questions:
+        questions, dropped_nl = filter_non_latin_questions(questions)
+        if dropped_nl:
+            print(f"  Filtered {len(dropped_nl)} non-Latin-output questions "
+                  f"from pool (keep {len(questions)})")
+            for q in dropped_nl[:5]:
+                print(f"    - {q[:120]}")
+            if len(dropped_nl) > 5:
+                print(f"    ... and {len(dropped_nl) - 5} more")
+
     # ReasonIF template cache (only needed if any source is reasonif).
     # Defaults to the question source if no dedicated template parquet was
     # provided — backwards compatible with runs where both live in one file.
@@ -1351,9 +1788,22 @@ async def build_sft_dataset(
     question_pool = [questions[i] for i in sorted({a.question_idx for a in assignments})]
 
     try:
+        # Stage 0.5 — pre-pick suppression keywords for with-instruction so
+        # the keyword can be embedded in the Stage-1 prompt.
+        if config.include_instruction_at_generation:
+            print("\n" + "-" * 60)
+            print("STAGE 0.5: Pre-pick suppression keywords (with-instruction)")
+            print("-" * 60)
+            await _prepick_suppression_keywords(
+                config, assignments, editor_client,
+            )
+
         # Stage 1
         print("\n" + "-" * 60)
-        print("STAGE 1: Generate raw rollouts (instruction stripped)")
+        if config.include_instruction_at_generation:
+            print("STAGE 1: Generate raw rollouts (instruction included)")
+        else:
+            print("STAGE 1: Generate raw rollouts (instruction stripped)")
         print("-" * 60)
         rollouts = await stage1_generate(
             config, assignments, base_client, analysis_channel=ac,
@@ -1450,6 +1900,15 @@ def _make_clients(
 
 
 def _needs_editor(config: BuildConfig) -> bool:
+    """Whether an editor client is needed.
+
+    With-instruction generation always benefits from an editor (meta-removal
+    pre-edit + pre-pick suppression keywords + with-instruction overrides
+    like json_format). Without-instruction only needs the editor for the
+    legacy LLM_TRANSFORMS that aren't base-model regen.
+    """
+    if config.include_instruction_at_generation:
+        return True
     for s in config.sources:
         for m in s.resolve_modes():
             if m in LLM_TRANSFORMS and m not in BASE_MODEL_TRANSFORMS:

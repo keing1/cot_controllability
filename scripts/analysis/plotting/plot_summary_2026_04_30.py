@@ -107,6 +107,28 @@ EXCLUDE_MODES = {"cotcontrol": {"baseline"}, "reasonif": set()}
 
 MQA_VARIANTS_SIDE_TASK = ["less_reasoning_v2", "vocab_control", "dont_think_v2"]
 
+# Display labels for the per-instruction bars plot.
+INSTR_DISPLAY = {
+    # reasonif
+    "reasoning_language": "lang",
+    "number_words":       "word limit",
+    "english_capital":    "uppercase",
+    "end_checker":        "end phrase",
+    "json_format":        "json",
+    "no_comma":           "no comma",
+    # cotcontrol
+    "baseline":                  "baseline",
+    "word_suppression":          "word supp",
+    "multiple_word_suppression": "multi word supp",
+    "uppercase_thinking":        "uppercase",
+    "lowercase_thinking":        "lowercase",
+    "alternating_case":          "alt case",
+    "repeat_sentences":          "repeat sent",
+    "end_of_sentence":           "end of sent",
+    "meow_between_words":        "meow",
+    "ignore_question":           "ignore Q",
+}
+
 
 # ---------------------------------------------------------------------------
 # File resolution
@@ -691,6 +713,88 @@ def plot_per_model_training_curves(fname: str = "per_model_training_curves.png")
 
 
 # ---------------------------------------------------------------------------
+# Per-instruction bars (Base vs FT@ckpt, N models × 2 per instruction).
+# Mirrors plot_summary_2026_04_20.py layout but parameterized by ckpt.
+# ---------------------------------------------------------------------------
+
+
+def plot_instruction_bars(dataset_key: str, title: str, fname: str,
+                           ckpt: str) -> None:
+    exclude = EXCLUDE_MODES.get(dataset_key, set())
+
+    per_model_base: dict[str, dict[str, tuple[int, int]]] = {}
+    per_model_ft: dict[str, dict[str, tuple[int, int]]] = {}
+    all_instr: set[str] = set()
+    for model in MODEL_GROUPS:
+        bp = _base_std(model, dataset_key)
+        fp = _ft_std(model, dataset_key, ckpt)
+        base = {m: v for m, v in compliance_counts(bp).items()
+                if m not in exclude} if bp else {}
+        ft = {m: v for m, v in compliance_counts(fp).items()
+              if m not in exclude} if fp else {}
+        per_model_base[model] = base
+        per_model_ft[model] = ft
+        all_instr |= set(base.keys()) | set(ft.keys())
+
+    instr_types = sorted(all_instr, key=lambda t: INSTR_DISPLAY.get(t, t))
+    if not instr_types:
+        print(f"  WARNING: no instruction types for {dataset_key}@{ckpt}")
+        return
+
+    n_groups = len(instr_types)
+    n_bars = len(MODEL_GROUPS) * 2
+    bar_width = 0.88 / n_bars
+    x = np.arange(n_groups)
+
+    fig, ax = plt.subplots(figsize=(max(18, n_groups * 2.2), 6.5))
+    top_vals: list[float] = []
+    for m_idx, model in enumerate(MODEL_GROUPS):
+        color = MODEL_COLORS[model]
+        base_vals, ft_vals, base_errs, ft_errs = [], [], [], []
+        for it in instr_types:
+            bc, bt = per_model_base[model].get(it, (0, 0))
+            fc, ft_ = per_model_ft[model].get(it, (0, 0))
+            bp_ = (bc / bt) if bt else 0.0
+            fp_ = (fc / ft_) if ft_ else 0.0
+            base_vals.append(bp_ * 100)
+            ft_vals.append(fp_ * 100)
+            base_errs.append(wald_err_pct(bp_, bt))
+            ft_errs.append(wald_err_pct(fp_, ft_))
+        off_b = (m_idx * 2 - n_bars / 2 + 0.5) * bar_width
+        off_f = (m_idx * 2 + 1 - n_bars / 2 + 0.5) * bar_width
+        ax.bar(x + off_b, base_vals, bar_width,
+               yerr=base_errs, ecolor="black",
+               error_kw={"linewidth": 0.6, "capsize": 1.5},
+               color=color, alpha=0.45, label=f"{model} Base",
+               edgecolor="white", linewidth=0.3)
+        ax.bar(x + off_f, ft_vals, bar_width,
+               yerr=ft_errs, ecolor="black",
+               error_kw={"linewidth": 0.6, "capsize": 1.5},
+               color=color, alpha=0.95, label=f"{model} FT",
+               edgecolor="white", linewidth=0.3)
+        top_vals.extend(v + e for v, e in zip(base_vals, base_errs))
+        top_vals.extend(v + e for v, e in zip(ft_vals, ft_errs))
+
+    y_lo, y_hi = _autoscale(top_vals, pad_frac=0.08)
+    labels = [INSTR_DISPLAY.get(it, it) for it in instr_types]
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=10)
+    ax.set_ylabel("Compliance (%)", fontsize=11)
+    ax.set_ylim(y_lo, y_hi)
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(fontsize=8, loc="upper right", ncol=len(MODEL_GROUPS))
+    fig.suptitle(
+        f"{title} per-instruction — Base vs FT @ ckpt {ckpt}  (80% Wald CI)",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    out = OUTDIR / fname
+    fig.savefig(out, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out}  (y {y_lo:.1f}-{y_hi:.1f})")
+
+
+# ---------------------------------------------------------------------------
 # Plot 4 — model size vs uplift at first ckpt
 # ---------------------------------------------------------------------------
 
@@ -986,6 +1090,15 @@ def main() -> None:
         plot_compliance_for_ckpt(
             "reasonif", "ReasonIF compliance",
             f"compliance_{suffix}_reasonif.png", ckpt,
+        )
+        print(f"Per-instruction bars for ckpt={ckpt}...")
+        plot_instruction_bars(
+            "cotcontrol", "CoTControl",
+            f"instruction_bars_cotcontrol_{suffix}.png", ckpt,
+        )
+        plot_instruction_bars(
+            "reasonif", "ReasonIF",
+            f"instruction_bars_reasonif_{suffix}.png", ckpt,
         )
 
     print("\n=== Plot 5 (completion length curves; monitor-independent) ===")

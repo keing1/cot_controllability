@@ -42,6 +42,11 @@ class FTModelSpec:
     renderer_type: str                 # "gpt-oss" | "qwen3"
     reasoning_effort: str              # "low"/"medium"/"high"/"none"
     short_name: str = ""
+    # Optional Tinker state path to resume training from (e.g. a previous
+    # run's final ``state_path``). When set, training continues from that
+    # checkpoint instead of fresh-initializing a new LoRA. Used for the v5
+    # continuation pipeline.
+    load_checkpoint_path: str | None = None
 
     def __post_init__(self):
         if not self.short_name:

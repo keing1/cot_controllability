@@ -5,6 +5,7 @@ Launch:  uv run streamlit run scripts/analysis/sft_viewer.py
 
 from __future__ import annotations
 
+import difflib
 import html as html_mod
 import json
 import re
@@ -45,13 +46,18 @@ CNAME_TO_SHORT = {
 #   v1-v3 (with -sft):   "gpt-oss-20b-reasonif-sft.parquet"
 #                        "gpt-oss-20b-mixed5k-sft-stripped-ac.parquet"
 #   v4+   (no -sft):     "gpt-oss-20b-mixed5k-v4-stripped-ac.parquet"
+#   smoke runs:          "gpt-oss-20b-smoke-with-instr.parquet"
+#                        "gpt-oss-20b-smoke-without-instr.parquet"
 # Composition can carry a -v<N> suffix (e.g. "mixed5k-v4"). The "-sft"
-# infix is optional. Trailing variant tags ("-stripped", "-ac") are matched
-# by the variant suffix.
-_COMPOSITION_RE = r"(?:reasonif|cotcontrol|mixed[0-9a-z]*(?:-v\d+)?)"
-_MODEL_RE = re.compile(rf"^(.+?)-{_COMPOSITION_RE}(?:-sft)?(?:-[a-z]+)*\.parquet$")
-_VARIANT_RE = re.compile(rf"-{_COMPOSITION_RE}(?:-sft)?((?:-[a-z]+)*)\.parquet$")
-_COMPOSITION_EXTRACT_RE = re.compile(rf"-({_COMPOSITION_RE})(?:-sft)?(?:-[a-z]+)*\.parquet$")
+# infix is optional. Trailing variant tags ("-stripped", "-ac",
+# "-with-instr", "-without-instr") are matched by the variant suffix.
+_COMPOSITION_RE = r"(?:reasonif|cotcontrol|mixed[0-9a-z]*(?:-v\d+)?|smoke)"
+# Suffix tokens are alpha-only or alpha-with-internal-hyphen (e.g.
+# "with-instr", "without-instr"). Match one-or-more dash-separated tokens.
+_SUFFIX_RE = r"(?:-[a-z]+(?:-[a-z]+)*)*"
+_MODEL_RE = re.compile(rf"^(.+?)-{_COMPOSITION_RE}(?:-sft)?{_SUFFIX_RE}\.parquet$")
+_VARIANT_RE = re.compile(rf"-{_COMPOSITION_RE}(?:-sft)?({_SUFFIX_RE})\.parquet$")
+_COMPOSITION_EXTRACT_RE = re.compile(rf"-({_COMPOSITION_RE})(?:-sft)?{_SUFFIX_RE}\.parquet$")
 
 
 def _parse_composition(filename: str) -> str:
@@ -59,23 +65,47 @@ def _parse_composition(filename: str) -> str:
     return m.group(1) if m else "unknown"
 
 
-def _parse_variant(filename: str) -> tuple[bool, bool]:
-    """Parse suffix to determine (is_stripped, is_ac)."""
+def _parse_variant(filename: str) -> tuple[bool, bool, str]:
+    """Parse suffix to determine (is_stripped, is_ac, generation_mode).
+
+    ``generation_mode`` is one of:
+      "with-instr"     — Stage-1 prompt included the constraint instruction
+      "without-instr"  — Stage-1 prompt stripped of the constraint
+      "stripped"       — legacy synonym for without-instr (older runs)
+      ""               — unspecified
+    """
     m = _VARIANT_RE.search(filename)
     if not m:
-        return False, False
-    suffix = m.group(1)  # e.g. "", "-stripped", "-stripped-ac"
-    return "-stripped" in suffix, "-ac" in suffix
+        return False, False, ""
+    suffix = m.group(1)
+    is_with = "-with-instr" in suffix
+    is_without = "-without-instr" in suffix
+    is_stripped = "-stripped" in suffix
+    is_ac = "-ac" in suffix
+    if is_with:
+        gen = "with-instr"
+    elif is_without:
+        gen = "without-instr"
+    elif is_stripped:
+        gen = "stripped"
+    else:
+        gen = ""
+    return is_stripped, is_ac, gen
 
 
-def _variant_label(stripped: bool, ac: bool) -> str:
-    if stripped and ac:
-        return "stripped + ac"
+def _variant_label(stripped: bool, ac: bool, gen: str = "") -> str:
+    pieces: list[str] = []
+    if gen == "with-instr":
+        pieces.append("with-instr")
+    elif gen == "without-instr":
+        pieces.append("without-instr")
     elif stripped:
-        return "stripped"
-    elif ac:
-        return "ac"
-    return "original"
+        pieces.append("stripped")
+    if ac:
+        pieces.append("ac")
+    if not pieces:
+        return "original"
+    return " + ".join(pieces)
 
 
 # ---------------------------------------------------------------------------
@@ -121,18 +151,28 @@ def _extract_parts(messages):
 
 
 @st.cache_data
-def discover_files() -> list[tuple[str, str, Path, bool, bool, str]]:
-    """Return (model_label, filename, path, is_stripped, is_ac, composition)
-    for every SFT parquet under ``results/sft``."""
+def discover_files() -> list[tuple[str, str, Path, bool, bool, str, str]]:
+    """Return (model_label, display_name, path, is_stripped, is_ac,
+    composition, generation_mode) for every SFT parquet under ``results/sft``.
+
+    Searches recursively so files in subdirectories (e.g.
+    ``results/sft/smoke_with_without/``) are picked up too. ``display_name``
+    includes the relative subdir for disambiguation.
+    """
     if not SFT_DIR.exists():
         return []
     results = []
-    for p in sorted(SFT_DIR.glob("*.parquet")):
+    for p in sorted(SFT_DIR.rglob("*.parquet")):
         model = _model_from_filename(p.name)
-        if model:
-            stripped, ac = _parse_variant(p.name)
-            comp = _parse_composition(p.name)
-            results.append((model, p.name, p, stripped, ac, comp))
+        if not model:
+            continue
+        stripped, ac, gen = _parse_variant(p.name)
+        comp = _parse_composition(p.name)
+        rel = p.relative_to(SFT_DIR)
+        # Use the relative path for files in subdirectories so the user can
+        # tell smoke runs apart from production runs in the picker.
+        display = str(rel) if rel.parent != Path(".") else p.name
+        results.append((model, display, p, stripped, ac, comp, gen))
     return results
 
 
@@ -191,9 +231,35 @@ with st.sidebar:
     # Variant filters (only show options that exist for this model)
     available_stripped = sorted({f[3] for f in matching})
     available_ac = sorted({f[4] for f in matching})
+    available_gen = sorted({f[6] for f in matching})
 
-    # Stripped filter
-    if len(available_stripped) > 1:
+    # Generation-mode filter (with-instr vs without-instr) — surfaces the new
+    # smoke-run variant axis. Falls back gracefully when not applicable.
+    meaningful_gen = [g for g in available_gen if g]
+    if len(meaningful_gen) > 1:
+        gen_options = {
+            "with-instr": "With instruction",
+            "without-instr": "Without instruction",
+            "stripped": "Stripped (legacy)",
+            "": "(unspecified)",
+        }
+        sel_gen = st.radio(
+            "Generation mode",
+            available_gen,
+            format_func=lambda x: gen_options.get(x, x or "(unspecified)"),
+            horizontal=True,
+        )
+        matching = [f for f in matching if f[6] == sel_gen]
+    elif len(meaningful_gen) == 1:
+        lbl = {
+            "with-instr": "With instruction",
+            "without-instr": "Without instruction",
+            "stripped": "Stripped (legacy)",
+        }.get(meaningful_gen[0], meaningful_gen[0])
+        st.caption(f"Generation mode: **{lbl}** (only option)")
+
+    # Stripped filter (only meaningful when generation mode isn't already set)
+    if not meaningful_gen and len(available_stripped) > 1:
         stripped_options = {True: "Stripped", False: "Original"}
         sel_stripped = st.radio(
             "Prompt variant",
@@ -202,7 +268,7 @@ with st.sidebar:
             horizontal=True,
         )
         matching = [f for f in matching if f[3] == sel_stripped]
-    elif len(available_stripped) == 1:
+    elif not meaningful_gen and len(available_stripped) == 1:
         lbl = "Stripped" if available_stripped[0] else "Original"
         st.caption(f"Prompt variant: **{lbl}** (only option)")
 
@@ -224,7 +290,7 @@ with st.sidebar:
     if len(matching) == 1:
         sel_file = matching[0]
     else:
-        file_names = [name for _, name, _, _, _, _ in matching]
+        file_names = [f[1] for f in matching]
         sel_name = st.selectbox("File", file_names)
         sel_file = next(f for f in matching if f[1] == sel_name)
 
@@ -388,17 +454,153 @@ if "generation_prompt" in row.index:
                 unsafe_allow_html=True,
             )
 
-# Reasoning
-if reasoning:
-    word_count = len(re.findall(r"\w+", reasoning))
-    char_count = len(reasoning)
-    st.markdown(f"### Reasoning ({word_count:,} words, {char_count:,} chars)")
+# Reasoning — side-by-side diff when an original (pre-edit) reasoning exists.
+# Word-level diff highlighting: removed text shown in red, added text in green.
+
+_DEL_SPAN = '<span style="background:#ffd0d0;color:#900;">{}</span>'
+_INS_SPAN = '<span style="background:#d0f4d0;color:#0a0;">{}</span>'
+
+
+def _word_tokens(text: str) -> list[str]:
+    """Token list that preserves whitespace as separate tokens — keeps the
+    diff aligned to natural word boundaries while still rendering the
+    original whitespace verbatim."""
+    return re.findall(r"\S+|\s+", text or "")
+
+
+def _structural_chunks(text: str) -> list[str]:
+    """Split text into structural chunks for the OUTER diff pass.
+
+    Strategy:
+      1. If the text has multiple lines, split on newlines (keeping the
+         newline character with each chunk).
+      2. Otherwise (single long line, common in model rollouts), split on
+         sentence boundaries (`.!?` followed by whitespace) while keeping
+         the punctuation.
+
+    The OUTER diff matches whole chunks against whole chunks. This stops
+    `SequenceMatcher` from producing spurious matches on isolated stop
+    words across long deleted/inserted regions, which was the failure
+    mode the user reported.
+    """
+    if not text:
+        return [""]
+    if "\n" in text:
+        # Split keeping newlines attached so we can re-render whitespace
+        # exactly. ``splitlines(keepends=True)`` does this.
+        return text.splitlines(keepends=True)
+    # Single-line text — fall back to sentence-level chunks. Regex captures
+    # everything up to a terminator + the terminator + any trailing whitespace.
+    chunks = re.findall(r"[^.!?]*[.!?]+\s*|[^.!?]+$", text)
+    return chunks if chunks else [text]
+
+
+def _word_level_diff_html(a_text: str, b_text: str) -> tuple[str, str]:
+    """Inner pass — word-level diff within a pair of replaced chunks."""
+    a = _word_tokens(a_text)
+    b = _word_tokens(b_text)
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    left_parts: list[str] = []
+    right_parts: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        a_chunk = "".join(a[i1:i2])
+        b_chunk = "".join(b[j1:j2])
+        if tag == "equal":
+            esc = html_mod.escape(a_chunk)
+            left_parts.append(esc)
+            right_parts.append(esc)
+        elif tag == "delete":
+            left_parts.append(_DEL_SPAN.format(html_mod.escape(a_chunk)))
+        elif tag == "insert":
+            right_parts.append(_INS_SPAN.format(html_mod.escape(b_chunk)))
+        elif tag == "replace":
+            left_parts.append(_DEL_SPAN.format(html_mod.escape(a_chunk)))
+            right_parts.append(_INS_SPAN.format(html_mod.escape(b_chunk)))
+    return "".join(left_parts), "".join(right_parts)
+
+
+def _render_diff_html(orig: str, edited: str) -> tuple[str, str]:
+    """Two-level diff: structural chunks first, words within replaced
+    chunks. Returns (orig_html, edited_html).
+
+    Removed text gets a red background in the original column; added
+    text gets a green background in the edited column.
+    """
+    a_chunks = _structural_chunks(orig)
+    b_chunks = _structural_chunks(edited)
+    sm = difflib.SequenceMatcher(a=a_chunks, b=b_chunks, autojunk=False)
+    left_parts: list[str] = []
+    right_parts: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        a_text = "".join(a_chunks[i1:i2])
+        b_text = "".join(b_chunks[j1:j2])
+        if tag == "equal":
+            esc = html_mod.escape(a_text)
+            left_parts.append(esc)
+            right_parts.append(esc)
+        elif tag == "delete":
+            left_parts.append(_DEL_SPAN.format(html_mod.escape(a_text)))
+        elif tag == "insert":
+            right_parts.append(_INS_SPAN.format(html_mod.escape(b_text)))
+        elif tag == "replace":
+            # Recurse into a word-level diff for the replaced region.
+            sub_left, sub_right = _word_level_diff_html(a_text, b_text)
+            left_parts.append(sub_left)
+            right_parts.append(sub_right)
+    return "".join(left_parts), "".join(right_parts)
+
+
+def _reasoning_box_html(content_html: str, bg: str = "#e8f5e9") -> str:
+    """Wrap a (possibly highlighted) chunk of reasoning HTML in the same
+    monospace box style we use elsewhere."""
+    return (
+        f'<div style="white-space: pre-wrap; word-wrap: break-word; '
+        f'font-family: monospace; font-size: 0.85em; background: {bg}; '
+        f'padding: 0.75em; border-radius: 0.375em; max-height: 600px; '
+        f'overflow-y: auto;">{content_html}</div>'
+    )
+
+
+# Recover the original (pre-edit) reasoning if present.
+orig_reasoning = ""
+if "messages_original" in row.index:
+    _, orig_reasoning, _ = _extract_parts(row["messages_original"])
+
+word_count = len(re.findall(r"\w+", reasoning)) if reasoning else 0
+char_count = len(reasoning) if reasoning else 0
+
+if reasoning and orig_reasoning and orig_reasoning != reasoning:
+    # Side-by-side diff view
+    orig_wc = len(re.findall(r"\w+", orig_reasoning))
     st.markdown(
-        '<div style="white-space: pre-wrap; word-wrap: break-word; font-family: monospace; '
-        "font-size: 0.85em; background: #e8f5e9; padding: 0.75em; border-radius: 0.375em; "
-        f'max-height: 600px; overflow-y: auto;">{html_mod.escape(reasoning)}</div>',
+        f"### Reasoning — original vs edited "
+        f"(orig: {orig_wc:,} words / {len(orig_reasoning):,} chars; "
+        f"edited: {word_count:,} words / {char_count:,} chars)"
+    )
+    st.caption(
+        '<span style="background:#ffd0d0;color:#900;padding:0 4px;'
+        'border-radius:3px;">red = removed</span> &nbsp; '
+        '<span style="background:#d0f4d0;color:#0a0;padding:0 4px;'
+        'border-radius:3px;">green = added</span>',
         unsafe_allow_html=True,
     )
+    left_html, right_html = _render_diff_html(orig_reasoning, reasoning)
+    col_orig, col_edit = st.columns(2)
+    with col_orig:
+        st.markdown("**Original (pre-edit)**")
+        st.markdown(_reasoning_box_html(left_html, bg="#fff5f5"),
+                    unsafe_allow_html=True)
+    with col_edit:
+        st.markdown("**Edited (final)**")
+        st.markdown(_reasoning_box_html(right_html, bg="#f0fff4"),
+                    unsafe_allow_html=True)
+elif reasoning:
+    # Single-column view (no diff to show)
+    st.markdown(f"### Reasoning ({word_count:,} words, {char_count:,} chars)")
+    if orig_reasoning and orig_reasoning == reasoning:
+        st.caption("(no edits — original and final reasoning are identical)")
+    st.markdown(_reasoning_box_html(html_mod.escape(reasoning)),
+                unsafe_allow_html=True)
 
 # Response
 if response:
@@ -409,16 +611,6 @@ if response:
         f'max-height: 400px; overflow-y: auto;">{html_mod.escape(response)}</div>',
         unsafe_allow_html=True,
     )
-
-# Original (pre-transform) comparison
-if "messages_original" in row.index:
-    orig = row["messages_original"]
-    orig_prompt, orig_reasoning, orig_response = _extract_parts(orig)
-    if orig_reasoning and orig_reasoning != reasoning:
-        with st.expander("Original Reasoning (pre-transform)"):
-            orig_wc = len(orig_reasoning.split())
-            st.caption(f"{orig_wc:,} words, {len(orig_reasoning):,} chars")
-            st.code(orig_reasoning, language=None)
 
 # Full metadata
 with st.expander("Full Row Data"):

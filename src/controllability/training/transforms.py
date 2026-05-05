@@ -46,9 +46,12 @@ def filter_constraint_args(constraint_args: dict | None) -> dict:
 class TransformContext:
     """Everything a transform may need. Callers fill the relevant fields."""
 
-    # Editor model (default: OpenRouter / gpt-4.1). Used by reasonif LLM
-    # transforms and cotcontrol word-suppression.
+    # Editor model client (OpenRouter). Used by reasonif LLM transforms and
+    # cotcontrol word-suppression.
     llm_client: "InferenceClient | None" = None
+
+    # Editor model name (OpenRouter slug). Defaults to gpt-5.4.
+    editor_model: str = "openai/gpt-5.4"
 
     # Same model that produced the Stage-1 rollout. Used by ignore_question
     # to regenerate reasoning that matches the base-model distribution.
@@ -143,7 +146,7 @@ async def transform_reasoning_language(
     lang_name = _LANGUAGE_NAMES.get(language, language)
 
     request = InferenceRequest(
-        model="openai/gpt-4.1",
+        model=ctx.editor_model,
         messages=[
             {"role": "system", "content": _TRANSLATE_SYSTEM.format(language=lang_name)},
             {"role": "user", "content": reasoning},
@@ -211,7 +214,7 @@ async def transform_number_words(
         return _truncate_to_word_limit(reasoning, actual_target - 1), {}
 
     request = InferenceRequest(
-        model="openai/gpt-4.1",
+        model=ctx.editor_model,
         messages=[
             {"role": "system", "content": _CONDENSE_PROMPT.format(llm_target=llm_target)},
             {"role": "user", "content": reasoning},
@@ -503,7 +506,7 @@ async def _pick_keywords_via_llm(
         f"## Question\n{question}\n\n## Reasoning trace\n{reasoning}"
     )
     request = InferenceRequest(
-        model="openai/gpt-4.1",
+        model=ctx.editor_model,
         messages=[
             {"role": "system", "content": _PICK_KEYWORD_PROMPT.format(n=n)},
             {"role": "user", "content": user_block},
@@ -574,7 +577,7 @@ async def _minimal_edit_suppress(
         f"## Reasoning to rewrite\n{reasoning}"
     )
     request = InferenceRequest(
-        model="openai/gpt-4.1",
+        model=ctx.editor_model,
         messages=[
             {"role": "system", "content": _SUPPRESS_SYSTEM},
             {"role": "user", "content": user_block},
@@ -645,16 +648,13 @@ async def transform_multiple_word_suppression(
 
 
 def _build_generation_prompt(question: str) -> str:
-    """The same stripped prompt used for Stage-1 rollouts.
+    """The CC Stage-1 prompt used for the alternate question in ignore_question.
 
-    Kept in sync with ``scripts/runs/build_sft_dataset.py`` — both construct
-    raw-reasoning prompts from a bare question.
+    ``ignore_question`` is a CoTControl mode, so the alternate-question
+    rollout should be elicited under the same CC Stage-1 format as the
+    primary rollout. Matches ``sft_builder._build_stage1_prompt(_, "cotcontrol", _)``.
     """
-    return (
-        "Think step-by-step, and place only your final answer inside the tags "
-        "`<answer>` and `</answer>`.\n\n"
-        f"Here is the question:\n\n{question}"
-    )
+    return f"Question: {question}"
 
 
 async def transform_ignore_question(

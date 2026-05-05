@@ -9,7 +9,7 @@ Key defaults:
   * Stage-1 prompts have the reasoning instruction stripped, so the model
     produces unconstrained reasoning that Stage-2 edits into compliant form.
   * analysis_channel defaults to True for gpt-oss base models, False otherwise.
-  * Editor model defaults to openai/gpt-4.1 (used for reasonif LLM transforms
+  * Editor model defaults to openai/gpt-5.4 (used for reasonif LLM transforms
     and cotcontrol word-suppression keyword picking + minimal rewriting).
   * Question pool defaults to external/reasonIF_ft/train-00000-of-00001.parquet
     (HuggingFaceH4/Multilingual-Thinking) — same pool used by the existing
@@ -222,7 +222,7 @@ def main() -> None:
     parser.add_argument("--max-concurrency", type=int, default=500)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--system-prompt", default=None)
-    parser.add_argument("--editor-model", default="openai/gpt-4.1")
+    parser.add_argument("--editor-model", default="openai/gpt-5.4")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-transform-retries", type=int, default=3)
     parser.add_argument("--run-id", default=None, help="Optional run identifier")
